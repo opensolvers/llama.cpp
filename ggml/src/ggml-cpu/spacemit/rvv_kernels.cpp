@@ -2619,6 +2619,130 @@ void forward_norm_f32(ggml_compute_params * params, ggml_tensor * op) {
     }
 }
 
+void forward_soft_max_f32(ggml_compute_params * params, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    const ggml_tensor * src2 = op->src[2];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+
+    float scale    = 1.0f;
+    float max_bias = 0.0f;
+    memcpy(&scale, (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (float *) dst->op_params + 1, sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    const int64_t nb11 = src1 ? src1->nb[1] : 1;
+    const int64_t nb12 = src1 ? src1->nb[2] : 1;
+    const int64_t nb13 = src1 ? src1->nb[3] : 1;
+
+    const int64_t ne12 = src1 ? src1->ne[2] : 1;
+    const int64_t ne13 = src1 ? src1->ne[3] : 1;
+
+    const uint32_t n_head      = ne02;
+    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(n_head));
+
+    const float m0 = powf(2.0f, -(max_bias) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    float * wp = (float *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
+
+    const bool use_f16 = (src1 && src1->type == GGML_TYPE_F16);
+
+    const float * sk = src2 ? (const float *) ((const char *) src2->data) : nullptr;
+
+    for (int64_t i03 = 0; i03 < ne03; i03++) {
+        for (int64_t i02 = 0; i02 < ne02; i02++) {
+            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
+                const int64_t i11 = i01;
+                const int64_t i12 = i02 % ne12;
+                const int64_t i13 = i03 % ne13;
+
+                const uint32_t h     = i02;
+                const float    slope = (max_bias > 0.0f) ?
+                                           (h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2 * (h - n_head_log2) + 1)) :
+                                           1.0f;
+
+                const float * sp = (const float *) ((const char *) src0->data + i01 * nb01 + i02 * nb02 + i03 * nb03);
+                float *       dp = (float *) ((char *) dst->data + i01 * nb1 + i02 * nb2 + i03 * nb3);
+
+                const ggml_fp16_t * mp_f16 =
+                    src1 ? (const ggml_fp16_t *) ((const char *) src1->data + i11 * nb11 + i12 * nb12 + i13 * nb13) :
+                           nullptr;
+                const float * mp_f32 =
+                    src1 ? (const float *) ((const char *) src1->data + i11 * nb11 + i12 * nb12 + i13 * nb13) : nullptr;
+
+                // wp = sp*scale + slope*mask
+                {
+                    int64_t       length = ne00;
+                    const float * sp_ptr = sp;
+                    float *       wp_ptr = wp;
+                    if (mp_f32 && !use_f16) {
+                        const float * mp_ptr = mp_f32;
+                        while (length > 0) {
+                            const size_t vl  = __riscv_vsetvl_e32m4(length);
+                            vfloat32m4_t v   = __riscv_vle32_v_f32m4(sp_ptr, vl);
+                            vfloat32m4_t vm  = __riscv_vle32_v_f32m4(mp_ptr, vl);
+                            v                = __riscv_vfmul_vf_f32m4(v, scale, vl);
+                            v                = __riscv_vfmacc_vf_f32m4(v, slope, vm, vl);
+                            __riscv_vse32_v_f32m4(wp_ptr, v, vl);
+                            sp_ptr += vl;
+                            mp_ptr += vl;
+                            wp_ptr += vl;
+                            length -= vl;
+                        }
+                    } else if (mp_f16 && use_f16) {
+                        const ggml_fp16_t * mp_ptr = mp_f16;
+                        while (length > 0) {
+                            const size_t vl  = __riscv_vsetvl_e32m2(length);
+                            vfloat32m2_t v   = __riscv_vle32_v_f32m2(sp_ptr, vl);
+                            vfloat16m1_t vh  = __riscv_vle16_v_f16m1((const _Float16 *) mp_ptr, vl);
+                            vfloat32m2_t vm  = __riscv_vfwcvt_f_f_v_f32m2(vh, vl);
+                            v                = __riscv_vfmul_vf_f32m2(v, scale, vl);
+                            v                = __riscv_vfmacc_vf_f32m2(v, slope, vm, vl);
+                            __riscv_vse32_v_f32m2(wp_ptr, v, vl);
+                            sp_ptr += vl;
+                            mp_ptr += vl;
+                            wp_ptr += vl;
+                            length -= vl;
+                        }
+                    } else {
+                        while (length > 0) {
+                            const size_t vl = __riscv_vsetvl_e32m4(length);
+                            vfloat32m4_t v  = __riscv_vle32_v_f32m4(sp_ptr, vl);
+                            v               = __riscv_vfmul_vf_f32m4(v, scale, vl);
+                            __riscv_vse32_v_f32m4(wp_ptr, v, vl);
+                            sp_ptr += vl;
+                            wp_ptr += vl;
+                            length -= vl;
+                        }
+                    }
+                }
+
+                float max = rvv_max_f32(wp, ne00);
+                if (sk) {
+                    max = MAX(max, sk[i02]);
+                }
+
+                memcpy(dp, wp, ne00 * sizeof(float));
+                float sum = rvv_softmax_exp_inplace_f32(dp, ne00, max);
+
+                if (sk) {
+                    sum += expf(sk[i02] - max);
+                }
+
+                rvv_scale_f32(dp, 1.0f / sum, ne00);
+            }
+        }
+    }
+}
+
 template <ggml_op op_type, typename T> void forward_binary(ggml_compute_params * params, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];

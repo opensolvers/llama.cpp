@@ -997,6 +997,15 @@ class tensor_traits_common : public tensor_traits_base {
                     default:
                         GGML_ABORT("fatal error");
                 }
+            case GGML_OP_SOFT_MAX:
+                switch (op->src[0]->type) {
+                    case GGML_TYPE_F32:
+                        spacemit_kernels::rvv::forward_soft_max_f32(params, op);
+                        return true;
+                    default:
+                        ggml_compute_forward_soft_max(params, op);
+                        return true;
+                }
             case GGML_OP_ADD:
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
@@ -1643,6 +1652,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                 break;
             case GGML_OP_NORM:
             case GGML_OP_RMS_NORM:
+            case GGML_OP_SOFT_MAX:
             case GGML_OP_ADD:
             case GGML_OP_SUB:
             case GGML_OP_MUL:
