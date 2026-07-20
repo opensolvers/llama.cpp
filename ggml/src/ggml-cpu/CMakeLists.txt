@@ -454,11 +454,16 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 ggml-cpu/spacemit/ime_env.cpp
                 ggml-cpu/spacemit/ime_env.h
                 ggml-cpu/spacemit/ime1_kernels.cpp
-                ggml-cpu/spacemit/ime2_kernels.cpp
                 ggml-cpu/spacemit/ime_kernels.h
                 ggml-cpu/spacemit/rvv_kernels.cpp
                 ggml-cpu/spacemit/rvv_kernels.h
             )
+            # IME2 (fp16/int4/pack ops: vpack.vv, vfwmadot, vmadot.hp) needs the SpaceMiT `xsmtvdotii`
+            # superset. Upstream binutils 2.46 (`xsmtvdot` v1.0) is IME1-only, and the X60 is IME1-only
+            # (use_ime2=0) — so only compile ime2_kernels.cpp when the toolchain actually supports IME2.
+            if ("RISCV64_SPACEMIT_IME2" IN_LIST RISCV64_SPACEMIT_IME_SPEC)
+                list(APPEND GGML_CPU_SOURCES ggml-cpu/spacemit/ime2_kernels.cpp)
+            endif()
         endif()
         if(NOT GGML_CPU_ALL_VARIANTS)
             set(MARCH_STR "rv64gc")
