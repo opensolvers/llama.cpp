@@ -5,7 +5,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
+
+#if defined(SPACEMIT_IME1_I8I8_COUNTERS)
+#    include <atomic>
+#    include <cstdint>
+#    include <cstdio>
+#    include <cstdlib>
+#    include <mutex>
+#endif
 
 #if !defined(__riscv_v) || !defined(__riscv_v_intrinsic)
 #    error "riscv v extension or v_intrinsic not enabled"
@@ -991,6 +1000,162 @@ void SQ4BitGemmM1Kernel_CompInt8_ScaleFp16_Impl(size_t          BlkLen,
         }
     }
 }
+// ===========================================================================
+// IME1 i8i8 (Q8_0 / Q6_K activations vs int8 weights) kernels.
+// Derived from the non-zero-point i8i4 M4/M1 kernels above. Differences:
+//   - B is full int8 (no 4-bit nibble packing): B tile load doubles from 4
+//     packed loads to 8 direct vle8 loads, and there is no vand/vsrl unpack
+//     and no `-8` Q4_0 recentre.
+//   - B block stride is BlkLen bytes/col (not BlkLen/2), no zero-point stream.
+//   - A path and the fp16-scale epilogue are IDENTICAL to i8i4 non-ZP, so
+//     `quantize_a_4row_i8` / `quantize_a_row_i8` are reused unchanged.
+// B layout per 16-col group, per k-block (validated by selftest_i8i8_tiled):
+//   [16 * fp16 scale = 32B][ SLICES(=BlkLen/8) * NGRP(=4) tiles, each 32B,
+//    in (slice, group) order; tile = 4 cols x 8 k, laid [col][k] ].
+// One INNER iteration (16 k) consumes 8 tiles = 256B via a single marching
+// pointer, so after INNER=BlkLen/16 iterations the pointer lands exactly on the
+// next k-block's scale (32 + 256*INNER == 32 + 16*BlkLen == perblk).
+
+// v2..v9 <- 8 contiguous 32B B tiles (slice-lo groups 0..3, slice-hi groups 0..3)
+#define LOAD_B_16x8x2_I8                        \
+    "vsetvli      t0, zero, e8, m1        \n\t" \
+    "vle8.v       v2, (s1)               \n\t" \
+    "addi         s1, s1, 32              \n\t" \
+    "vle8.v       v3, (s1)               \n\t" \
+    "addi         s1, s1, 32              \n\t" \
+    "vle8.v       v4, (s1)               \n\t" \
+    "addi         s1, s1, 32              \n\t" \
+    "vle8.v       v5, (s1)               \n\t" \
+    "addi         s1, s1, 32              \n\t" \
+    "vle8.v       v6, (s1)               \n\t" \
+    "addi         s1, s1, 32              \n\t" \
+    "vle8.v       v7, (s1)               \n\t" \
+    "addi         s1, s1, 32              \n\t" \
+    "vle8.v       v8, (s1)               \n\t" \
+    "addi         s1, s1, 32              \n\t" \
+    "vle8.v       v9, (s1)               \n\t" \
+    "addi         s1, s1, 32              \n\t"
+
+void SQ8BitGemmM4Kernel_CompInt8_ScaleFp16_Impl(size_t          BlkLen,
+                                                const uint8_t * QuantA,
+                                                const uint8_t * QuantBData,
+                                                float *         C,
+                                                size_t          CountN,
+                                                size_t          BlockCountK,
+                                                const size_t    ldc) {
+    size_t       LDC   = ldc * sizeof(float);
+    const size_t INNER = BlkLen / 16;
+    float        tmp[4 * 16];
+
+    for (size_t n = 0; n < CountN; n += 16) {
+        size_t    NBLKS         = (CountN - n) > 16 ? 16 : CountN - n;
+        uint8_t * QuantBDataPtr = (uint8_t *) QuantBData +             //
+                                  n * BlockCountK * BlkLen +           // b data (int8)
+                                  n * BlockCountK * sizeof(_Float16);  // scale
+        float * CPtr = C + n;
+        if (NBLKS < 16) {
+            CPtr = tmp;
+            LDC  = 16 * sizeof(float);
+        }
+
+        __asm__ volatile(
+            "vsetvli            t0, zero, e32, m8           \n\t"
+            "vxor.vv            v24, v24, v24               \n\t"
+            "addi               t3, %[BlockCountK], 0       \n\t"
+            "addi               a1, %[A], 0                 \n\t"
+            "addi               s1, %[B], 0                 \n\t"
+            "BLOCK_COUNTK_LOOP%=:                           \n\t"
+            "addi               s5, s1, 0                   \n\t"
+            "addi               s1, s5, 32                  \n\t"
+            "vsetvli            t0, zero, e32, m8           \n\t"
+            "vxor.vv            v16, v16, v16               \n\t"
+            // load a scale
+            "flw                f1, (a1)                    \n\t"
+            "flw                f2, 4(a1)                   \n\t"
+            "flw                f3, 8(a1)                   \n\t"
+            "flw                f4, 12(a1)                  \n\t"
+            "addi               a1, a1, 16                  \n\t"
+            "addi               t2, %[INNER], 0             \n\t"
+            "BLOCK_INNER_LOOP%=:                            \n\t"
+
+            LOAD_B_16x8x2_I8
+
+            "vsetvli            t0, zero, e8, m1            \n\t"
+            "vle8.v             v10, (a1)                   \n\t"
+            "addi               a1, a1, 32                  \n\t"
+            "vle8.v             v11, (a1)                   \n\t"
+            "addi               a1, a1, 32                  \n\t"
+
+            SQ4BIT_KERNEL_COMP_4x16x16
+
+            "addi               t2, t2, -1                  \n\t"
+            "bnez               t2, BLOCK_INNER_LOOP%=      \n\t"
+
+            LOAD_SCALE_4x16_FP16_OPT
+
+            "vsetvli            t0, zero, e32, m8           \n\t"
+            "vfcvt.f.x.v        v16, v16                    \n\t"
+            "vfmacc.vv          v24, v16, v8                \n\t"
+            "addi               t3, t3, -1                  \n\t"
+            "bnez               t3, BLOCK_COUNTK_LOOP%=     \n\t"
+            "RESULT_SAVE%=:                                 \n\t"
+
+            SAVE_RESULT_4x16
+
+            :
+            : [INNER] "r"(INNER), [A] "r"(QuantA), [B] "r"(QuantBDataPtr), [LDC] "r"(LDC),
+              [BlockCountK] "r"(BlockCountK), [C] "r"(CPtr)
+            : "cc", "t0", "t1", "t2", "t3", "a1", "a2", "a3", "a4", "f1", "f2", "f3", "f4", "s1", "s2", "s3", "s4",
+              "s5", "s6");
+    }
+}
+
+// v1 scalar M1 path for i8i8: only used for <=3 remainder rows and tg (baseline ran these on RVV).
+// Reads A = [4B f32 scale][BlkLen int8 natural k-order] per k-block,
+// B = tiled q8_0x16: per 16-col group per k-block [16xfp16 scale=32B][tiles (slice sl, group g), tile=4cols x 8k as [col][k]=32B].
+void SQ8BitGemmM1Kernel_CompInt8_ScaleFp16_Impl(size_t          BlkLen,
+                                                const uint8_t * QuantA,
+                                                const uint8_t * QuantBData,
+                                                float *         C,
+                                                size_t          CountN,
+                                                size_t          BlockCountK,
+                                                const size_t    ldc) {
+    GGML_UNUSED(ldc);
+    const size_t kblk_stride  = 32 + BlkLen * 16;
+    const size_t group_stride = BlockCountK * kblk_stride;
+    const size_t a_blk_stride = 4 + BlkLen;
+
+    for (size_t n = 0; n < CountN; ++n) {
+        const size_t    group = n / 16;
+        const size_t    c     = n % 16;
+        const size_t    g     = c / 4;
+        const size_t    cc    = c % 4;
+        const uint8_t * gbase = QuantBData + group * group_stride;
+        float           acc   = 0.0f;
+
+        for (size_t kb = 0; kb < BlockCountK; ++kb) {
+            const uint8_t * bscale_ptr = gbase + kb * kblk_stride;
+            _Float16        bsh;
+            memcpy(&bsh, bscale_ptr + c * sizeof(_Float16), sizeof(_Float16));
+            const float     b_scale = (float) bsh;
+            const int8_t *  btile   = (const int8_t *) (bscale_ptr + 32);
+
+            float a_scale;
+            memcpy(&a_scale, QuantA + kb * a_blk_stride, sizeof(float));
+            const int8_t * a_int8 = (const int8_t *) (QuantA + kb * a_blk_stride + 4);
+
+            int32_t isum = 0;
+            for (size_t k = 0; k < BlkLen; ++k) {
+                const size_t sl = k / 8;
+                const size_t kk = k % 8;
+                const size_t t  = sl * 4 + g;
+                isum += (int32_t) a_int8[k] * (int32_t) btile[t * 32 + cc * 8 + kk];
+            }
+            acc += a_scale * b_scale * (float) isum;
+        }
+        C[n] = acc;
+    }
+}
 }  // namespace
 
 namespace ime1 {
@@ -1020,6 +1185,52 @@ size_t gemm_kernel_i8i4(size_t          blk_len,
             SQ4BitGemmM1Kernel_CompInt8_ScaleFp16_Impl<false>(blk_len, quant_a_ptr, quant_b_data, c_ptr, count_n,
                                                               k_blks, ldc);
         }
+        return 1;
+    }
+}
+size_t gemm_kernel_i8i8(size_t          blk_len,
+                        const uint8_t * quant_a_ptr,
+                        const uint8_t * quant_b_data,
+                        const uint8_t * quant_b_zp,
+                        float *         c_ptr,
+                        size_t          count_m,
+                        size_t          count_n,
+                        size_t          k_blks,
+                        size_t          ldc) {
+    GGML_UNUSED(quant_b_zp);
+#if defined(SPACEMIT_IME1_I8I8_COUNTERS)
+    // Temporary instrumentation (Oracle action #1): prove M4-vs-M1 coverage on the
+    // pp (batch) vs tg (batch=1) paths. Gated by env SPACEMIT_IME1_I8I8_COUNTERS=1;
+    // dumps totals atexit. Compile-in only when the macro is defined at build time.
+    static std::atomic<uint64_t> s_m4_calls{ 0 };
+    static std::atomic<uint64_t> s_m1_calls{ 0 };
+    static std::atomic<uint64_t> s_m4_rows{ 0 };
+    static std::atomic<uint64_t> s_m1_rows{ 0 };
+    static std::once_flag        s_atexit_flag;
+    if (std::getenv("SPACEMIT_IME1_I8I8_COUNTERS") != nullptr) {
+        std::call_once(s_atexit_flag, [] {
+            std::atexit([] {
+                fprintf(stderr,
+                        "[IME1_I8I8_COUNTERS] M4_calls=%llu M4_rows=%llu M1_calls=%llu M1_rows=%llu\n",
+                        (unsigned long long) s_m4_calls.load(), (unsigned long long) s_m4_rows.load(),
+                        (unsigned long long) s_m1_calls.load(), (unsigned long long) s_m1_rows.load());
+            });
+        });
+    }
+#endif
+    if (count_m >= 4) {
+#if defined(SPACEMIT_IME1_I8I8_COUNTERS)
+        s_m4_calls.fetch_add(1, std::memory_order_relaxed);
+        s_m4_rows.fetch_add(4, std::memory_order_relaxed);
+#endif
+        SQ8BitGemmM4Kernel_CompInt8_ScaleFp16_Impl(blk_len, quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks, ldc);
+        return 4;
+    } else {
+#if defined(SPACEMIT_IME1_I8I8_COUNTERS)
+        s_m1_calls.fetch_add(1, std::memory_order_relaxed);
+        s_m1_rows.fetch_add(1, std::memory_order_relaxed);
+#endif
+        SQ8BitGemmM1Kernel_CompInt8_ScaleFp16_Impl(blk_len, quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks, ldc);
         return 1;
     }
 }
