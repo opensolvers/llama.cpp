@@ -735,7 +735,9 @@ void gemm_kernel_i8i8_mrow_ref(size_t          blk_len,
 }
 
 template <size_t MB_ROWS, size_t NB_COLS>
-void gemm_kernel_i8i5_mrow_ref(size_t          blk_len,
+// GCC auto-vectorizes the qh extract with vluxei/vlseg sized to runtime VLEN.
+// At VLEN=1024 that form is slower than the scalar loop, so keep this scalar.
+__attribute__((noipa, optimize("no-tree-vectorize"))) void gemm_kernel_i8i5_mrow_ref(size_t          blk_len,
                                const uint8_t * quant_a_ptr,
                                const uint8_t * quant_b_data,
                                const uint8_t * quant_b_zp,
@@ -864,6 +866,7 @@ void gemm_kernel_i8i5_mrow_ref(size_t          blk_len,
                                    static_cast<int32_t>(a1) * static_cast<int32_t>(b1);
                         }
                         output[ci + mi * NB_COLS] += static_cast<float>(acc) * a_scale * b_scale;
+
                     }
                 }
             }
@@ -5727,23 +5730,25 @@ size_t gemm_kernel_i8i5(size_t          blk_len,
                         size_t          count_n,
                         size_t          k_blks,
                         size_t          ldc) {
-    if (count_m >= 4) {
-#if 0
-        gemm_kernel_i8i5_mrow_ref<4, 32>(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n,
-                                         k_blks, ldc);
-#else
-        gemm_kernel_i8i5_m4(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n, k_blks, ldc);
-#endif
-        return 4;
-    } else {
-#if 0
-        gemm_kernel_i8i5_mrow_ref<1, 32>(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n,
-                                         k_blks, ldc);
-#else
+    // Q5_0 is repacked with per-column qh. The asm kernel consumes qh as a
+    // v0.t mask over an m8 group, which does not match that layout. Q5_1 and
+    // Q5_K keep the asm path (quant_b_zp != nullptr).
+    if (quant_b_zp != nullptr) {
+        if (count_m >= 4) {
+            gemm_kernel_i8i5_m4(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n, k_blks, ldc);
+            return 4;
+        }
         gemm_kernel_i8i5_m1(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n, k_blks, ldc);
-#endif
         return 1;
     }
+    if (count_m >= 4) {
+        gemm_kernel_i8i5_mrow_ref<4, 32>(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n,
+                                         k_blks, ldc);
+        return 4;
+    }
+    gemm_kernel_i8i5_mrow_ref<1, 32>(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n,
+                                     k_blks, ldc);
+    return 1;
 }
 
 size_t moe_m2_gemm_kernel_i8i5(size_t           blk_len,

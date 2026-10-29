@@ -257,6 +257,60 @@ void ggml_gemv_q4_0_16x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
     }
 }
 
+void ggml_gemv_q4_0_64x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int qk = QK8_0;
+    const int nb = n / qk;
+    const int ncols_interleaved = 64;
+    const int blocklen = 1;
+
+    assert (n % qk == 0);
+    assert (nc % ncols_interleaved == 0);
+
+    UNUSED(s);
+    UNUSED(bs);
+    UNUSED(vx);
+    UNUSED(vy);
+    UNUSED(nr);
+    UNUSED(nc);
+    UNUSED(nb);
+    UNUSED(ncols_interleaved);
+    UNUSED(blocklen);
+
+    const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_q4_0x64 * b_ptr = (const block_q4_0x64 *) vx + (x * nb);
+
+        // 1x16 Accumulator
+        vfloat32m2_t sumf = __riscv_vfmv_v_f_f32m2(0.0f, 64);
+
+        for (int l = 0; l < nb; l++) {
+            // 1x16 Integer Accumulator
+            vint16m1_t sumi_0_lo_16 = __riscv_vmv_v_x_i16m1(0.0f, 64);
+            vint16m1_t sumi_0_hi_16 = __riscv_vmv_v_x_i16m1(0.0f, 64);
+
+            // Accumulation loop.
+            for (int i = 0; i < QK4_0 / 2; i++) {
+                // Load `b_ptr`.
+                const vint8mf2_t b_0_packed = __riscv_vle8_v_i8mf2((const int8_t *)&b_ptr[l].qs[i * 64], 64);
+                const vint8mf2_t b_0_lo = __riscv_vsra_vx_i8mf2(__riscv_vsll_vx_i8mf2(b_0_packed, 4, 64), 4, 64);
+                const vint8mf2_t b_0_hi = __riscv_vsra_vx_i8mf2(b_0_packed, 4, 64);
+
+                sumi_0_lo_16 = __riscv_vwmacc_vx_i16m1(sumi_0_lo_16, a_ptr[l].qs[i], b_0_lo, 64);
+                sumi_0_hi_16 = __riscv_vwmacc_vx_i16m1(sumi_0_hi_16, a_ptr[l].qs[16 + i], b_0_hi, 64);
+            }
+
+            const vint32m2_t sumi = __riscv_vwadd_vv_i32m2(sumi_0_lo_16, sumi_0_hi_16, 64);
+
+            const vfloat16m1_t b_d = __riscv_vle16_v_f16m1((const _Float16 *)b_ptr[l].d, 64);
+            const vfloat32m2_t d_0 = __riscv_vfwmul_vf_f32m2(b_d, *(const _Float16 *)&a_ptr[l].d, 64);
+
+            sumf = __riscv_vfmacc_vv_f32m2(sumf, __riscv_vfcvt_f_x_v_f32m2(sumi, 64), d_0, 64);
+        }
+
+        __riscv_vse32_v_f32m2(s + x * 64, sumf, 64);
+    }
+}
+
 void ggml_gemv_q4_K_16x1_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     const int qk = QK_K;
     const int nb = n / qk;
@@ -389,7 +443,121 @@ void ggml_gemv_q4_K_16x1_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
     }
 }
 
+void ggml_gemv_iq4_nl_64x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int qk = QK8_0;
+    const int nb = n / qk;
+    const int ncols_interleaved = 64;
+    const int blocklen = 1;
+
+    assert (n % qk == 0);
+    assert (nc % ncols_interleaved == 0);
+
+    UNUSED(s);
+    UNUSED(bs);
+    UNUSED(vx);
+    UNUSED(vy);
+    UNUSED(nr);
+    UNUSED(nc);
+    UNUSED(nb);
+    UNUSED(ncols_interleaved);
+    UNUSED(blocklen);
+
+    const vint8mf2_t values = __riscv_vle8_v_i8mf2(kvalues_iq4nl, 16);
+    const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_iq4_nlx64 * b_ptr = (const block_iq4_nlx64 *) vx + (x * nb);
+
+        // 1x16 Accumulator1
+        vfloat32m2_t sumf = __riscv_vfmv_v_f_f32m2(0.0f, 64);
+
+        for (int l = 0; l < nb; l++) {
+            // 1x16 integer accumulator
+            vint32m2_t sumi = __riscv_vmv_v_x_i32m2(0.0f, 64);
+
+            // Accumulation loop.
+            for (int i = 0; i < QK4_NL / 2; i++) {
+                // Load `b_ptr`.
+                const vuint8mf2_t b_0_packed = __riscv_vle8_v_u8mf2((const uint8_t *)&b_ptr[l].qs[i * 64], 64);
+                const vint8mf2_t b_0_lo = __riscv_vrgather_vv_i8mf2(values, __riscv_vand_vx_u8mf2(b_0_packed, 0xf, 64), 64);
+                const vint8mf2_t b_0_hi = __riscv_vrgather_vv_i8mf2(values, __riscv_vsrl_vx_u8mf2(b_0_packed, 4, 64), 64);
+                // const vint16m1_t b_0_lo_16 = __riscv_vwcvt_x_x_v_i16m1(b_0_lo, 64);
+                // const vint16m1_t b_0_hi_16 = __riscv_vwcvt_x_x_v_i16m1(b_0_hi, 64);
+
+                const vint16m1_t sumi_lo = __riscv_vwmul_vx_i16m1(b_0_lo, a_ptr[l].qs[i], 64);
+                const vint16m1_t sumi_hi = __riscv_vwmul_vx_i16m1(b_0_hi, a_ptr[l].qs[16 + i], 64);
+                sumi = __riscv_vadd_vv_i32m2(sumi, __riscv_vwadd_vv_i32m2(sumi_lo, sumi_hi, 64), 64);
+            }
+
+            const vfloat16m1_t b_d = __riscv_vle16_v_f16m1((const _Float16 *)b_ptr[l].d, 64);
+            const vfloat32m2_t d_0 = __riscv_vfwmul_vf_f32m2(b_d, *(const _Float16 *)&a_ptr[l].d, 64);
+
+            sumf = __riscv_vfmacc_vv_f32m2(sumf, __riscv_vfcvt_f_x_v_f32m2(sumi, 64), d_0, 64);
+        }
+
+        __riscv_vse32_v_f32m2(s + x * 64, sumf, 64);
+    }
+}
+
+void ggml_gemv_iq4_nl_16x1_v1024_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int qk = QK8_0;
+    const int nb = n / qk;
+    const int ncols_interleaved = 16;
+    const int blocklen = 1;
+
+    assert (n % qk == 0);
+    assert (nc % ncols_interleaved == 0);
+
+    UNUSED(s);
+    UNUSED(bs);
+    UNUSED(vx);
+    UNUSED(vy);
+    UNUSED(nr);
+    UNUSED(nc);
+    UNUSED(nb);
+    UNUSED(ncols_interleaved);
+    UNUSED(blocklen);
+
+    const vint8mf8_t values = __riscv_vle8_v_i8mf8(kvalues_iq4nl, 16);
+    const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_iq4_nlx16 * b_ptr = (const block_iq4_nlx16 *) vx + (x * nb);
+
+        // 1x16 Accumulator1
+        vfloat32mf2_t sumf = __riscv_vfmv_v_f_f32mf2(0.0f, 16);
+
+        for (int l = 0; l < nb; l++) {
+            // 1x16 integer accumulator
+            vint32mf2_t sumi = __riscv_vmv_v_x_i32mf2(0.0f, 16);
+
+            // Accumulation loop.
+            for (int i = 0; i < QK4_NL / 2; i++) {
+                // Load `b_ptr`.
+                const vuint8mf8_t b_0_packed = __riscv_vle8_v_u8mf8((const uint8_t *)&b_ptr[l].qs[i * 16], 16);
+                const vint8mf8_t b_0_lo = __riscv_vrgather_vv_i8mf8(values, __riscv_vand_vx_u8mf8(b_0_packed, 0xf, 16), 16);
+                const vint8mf8_t b_0_hi = __riscv_vrgather_vv_i8mf8(values, __riscv_vsrl_vx_u8mf8(b_0_packed, 4, 16), 16);
+                // const vint16mf4_t b_0_lo_16 = __riscv_vwcvt_x_x_v_i16mf4(b_0_lo, 16);
+                // const vint16mf4_t b_0_hi_16 = __riscv_vwcvt_x_x_v_i16mf4(b_0_hi, 16);
+
+                const vint16mf4_t sumi_lo = __riscv_vwmul_vx_i16mf4(b_0_lo, a_ptr[l].qs[i], 16);
+                const vint16mf4_t sumi_hi = __riscv_vwmul_vx_i16mf4(b_0_hi, a_ptr[l].qs[16 + i], 16);
+                sumi = __riscv_vadd_vv_i32mf2(sumi, __riscv_vwadd_vv_i32mf2(sumi_lo, sumi_hi, 16), 16);
+            }
+
+            const vfloat16mf4_t b_d = __riscv_vle16_v_f16mf4((const _Float16 *)b_ptr[l].d, 16);
+            const vfloat32mf2_t d_0 = __riscv_vfwmul_vf_f32mf2(b_d, *(const _Float16 *)&a_ptr[l].d, 16);
+
+            sumf = __riscv_vfmacc_vv_f32mf2(sumf, __riscv_vfcvt_f_x_v_f32mf2(sumi, 16), d_0, 16);
+        }
+
+        __riscv_vse32_v_f32mf2(s + x * 16, sumf, 16);
+    }
+}
+
 void ggml_gemv_iq4_nl_16x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    if (__riscv_vlenb() == 128) {
+        ggml_gemv_iq4_nl_16x1_v1024_q8_0(n, s, bs, vx, vy, nr, nc);
+        return;
+    }
     const int qk = QK8_0;
     const int nb = n / qk;
     const int ncols_interleaved = 16;
@@ -980,6 +1148,92 @@ void ggml_gemm_q4_0_16x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
     }
 }
 
+void ggml_gemm_q4_0_64x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int qk = QK8_0;
+    const int nb = n / qk;
+    const int ncols_interleaved = 64;
+    const int blocklen = 1;
+
+    assert (n % qk == 0);
+    assert (nr % 4 == 0);
+    assert (nc % ncols_interleaved == 0);
+
+    UNUSED(s);
+    UNUSED(bs);
+    UNUSED(vx);
+    UNUSED(vy);
+    UNUSED(nr);
+    UNUSED(nc);
+    UNUSED(nb);
+    UNUSED(ncols_interleaved);
+    UNUSED(blocklen);
+
+    for (int y = 0; y < nr / 4; y++) {
+        const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (y * nb);
+        for (int x = 0; x < nc / ncols_interleaved; x++) {
+            const block_q4_0x64 * b_ptr = (const block_q4_0x64 *) vx + (x * nb);
+
+            // 4x16 Accumulators
+            vfloat32m2_t sumf_0 = __riscv_vfmv_v_f_f32m2(0.0f, 64);
+            vfloat32m2_t sumf_1 = __riscv_vfmv_v_f_f32m2(0.0f, 64);
+            vfloat32m2_t sumf_2 = __riscv_vfmv_v_f_f32m2(0.0f, 64);
+            vfloat32m2_t sumf_3 = __riscv_vfmv_v_f_f32m2(0.0f, 64);
+
+            for (int l = 0; l < nb; l++) {
+                // 4x16 integer accumulators
+                vint16m1_t sumi_0_lo_16 = __riscv_vmv_v_x_i16m1(0.0f, 64);
+                vint16m1_t sumi_1_lo_16 = __riscv_vmv_v_x_i16m1(0.0f, 64);
+                vint16m1_t sumi_2_lo_16 = __riscv_vmv_v_x_i16m1(0.0f, 64);
+                vint16m1_t sumi_3_lo_16 = __riscv_vmv_v_x_i16m1(0.0f, 64);
+                vint16m1_t sumi_0_hi_16 = __riscv_vmv_v_x_i16m1(0.0f, 64);
+                vint16m1_t sumi_1_hi_16 = __riscv_vmv_v_x_i16m1(0.0f, 64);
+                vint16m1_t sumi_2_hi_16 = __riscv_vmv_v_x_i16m1(0.0f, 64);
+                vint16m1_t sumi_3_hi_16 = __riscv_vmv_v_x_i16m1(0.0f, 64);
+
+                // Accumulation loop.
+                for (int i = 0; i < QK4_0 / 2; i++) {
+                    // Load `b_ptr`.
+                    const vint8mf2_t b_0_packed = __riscv_vle8_v_i8mf2((const int8_t *)&b_ptr[l].qs[i * 64], 64);
+                    const vint8mf2_t b_0_lo = __riscv_vsra_vx_i8mf2(__riscv_vsll_vx_i8mf2(b_0_packed, 4, 64), 4, 64);
+                    const vint8mf2_t b_0_hi = __riscv_vsra_vx_i8mf2(b_0_packed, 4, 64);
+
+                    sumi_0_lo_16 = __riscv_vwmacc_vx_i16m1(sumi_0_lo_16, a_ptr[l].qs[i * 4], b_0_lo, 64);
+                    sumi_1_lo_16 = __riscv_vwmacc_vx_i16m1(sumi_1_lo_16, a_ptr[l].qs[i * 4 + 1], b_0_lo, 64);
+                    sumi_2_lo_16 = __riscv_vwmacc_vx_i16m1(sumi_2_lo_16, a_ptr[l].qs[i * 4 + 2], b_0_lo, 64);
+                    sumi_3_lo_16 = __riscv_vwmacc_vx_i16m1(sumi_3_lo_16, a_ptr[l].qs[i * 4 + 3], b_0_lo, 64);
+
+                    sumi_0_hi_16 = __riscv_vwmacc_vx_i16m1(sumi_0_hi_16, a_ptr[l].qs[64 + i * 4], b_0_hi, 64);
+                    sumi_1_hi_16 = __riscv_vwmacc_vx_i16m1(sumi_1_hi_16, a_ptr[l].qs[64 + i * 4 + 1], b_0_hi, 64);
+                    sumi_2_hi_16 = __riscv_vwmacc_vx_i16m1(sumi_2_hi_16, a_ptr[l].qs[64 + i * 4 + 2], b_0_hi, 64);
+                    sumi_3_hi_16 = __riscv_vwmacc_vx_i16m1(sumi_3_hi_16, a_ptr[l].qs[64 + i * 4 + 3], b_0_hi, 64);
+                }
+
+                // Do the final accumulation in i32 to prevent overflow.
+                const vint32m2_t sumi_0 = __riscv_vwadd_vv_i32m2(sumi_0_lo_16, sumi_0_hi_16, 64);
+                const vint32m2_t sumi_1 = __riscv_vwadd_vv_i32m2(sumi_1_lo_16, sumi_1_hi_16, 64);
+                const vint32m2_t sumi_2 = __riscv_vwadd_vv_i32m2(sumi_2_lo_16, sumi_2_hi_16, 64);
+                const vint32m2_t sumi_3 = __riscv_vwadd_vv_i32m2(sumi_3_lo_16, sumi_3_hi_16, 64);
+
+                const vfloat16m1_t b_d = __riscv_vle16_v_f16m1((const _Float16 *)b_ptr[l].d, 64);
+                const vfloat32m2_t d_0 = __riscv_vfwmul_vf_f32m2(b_d, *(const _Float16 *)&a_ptr[l].d[0], 64);
+                const vfloat32m2_t d_1 = __riscv_vfwmul_vf_f32m2(b_d, *(const _Float16 *)&a_ptr[l].d[1], 64);
+                const vfloat32m2_t d_2 = __riscv_vfwmul_vf_f32m2(b_d, *(const _Float16 *)&a_ptr[l].d[2], 64);
+                const vfloat32m2_t d_3 = __riscv_vfwmul_vf_f32m2(b_d, *(const _Float16 *)&a_ptr[l].d[3], 64);
+
+                sumf_0 = __riscv_vfmacc_vv_f32m2(sumf_0, __riscv_vfcvt_f_x_v_f32m2(sumi_0, 64), d_0, 64);
+                sumf_1 = __riscv_vfmacc_vv_f32m2(sumf_1, __riscv_vfcvt_f_x_v_f32m2(sumi_1, 64), d_1, 64);
+                sumf_2 = __riscv_vfmacc_vv_f32m2(sumf_2, __riscv_vfcvt_f_x_v_f32m2(sumi_2, 64), d_2, 64);
+                sumf_3 = __riscv_vfmacc_vv_f32m2(sumf_3, __riscv_vfcvt_f_x_v_f32m2(sumi_3, 64), d_3, 64);
+            }
+
+            __riscv_vse32_v_f32m2(s + (y * 4 + 0) * bs + x * 64, sumf_0, 64);
+            __riscv_vse32_v_f32m2(s + (y * 4 + 1) * bs + x * 64, sumf_1, 64);
+            __riscv_vse32_v_f32m2(s + (y * 4 + 2) * bs + x * 64, sumf_2, 64);
+            __riscv_vse32_v_f32m2(s + (y * 4 + 3) * bs + x * 64, sumf_3, 64);
+        }
+    }
+}
+
 void ggml_gemm_q4_K_16x1_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     const int qk = QK_K;
     const int nb = n / qk;
@@ -1249,7 +1503,179 @@ void ggml_gemm_q4_K_16x1_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
     }
 }
 
+void ggml_gemm_iq4_nl_64x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int qk = QK8_0;
+    const int nb = n / qk;
+    const int ncols_interleaved = 64;
+    const int blocklen = 1;
+
+    assert (n % qk == 0);
+    assert (nr % 4 == 0);
+    assert (nc % ncols_interleaved == 0);
+
+    UNUSED(s);
+    UNUSED(bs);
+    UNUSED(vx);
+    UNUSED(vy);
+    UNUSED(nr);
+    UNUSED(nc);
+    UNUSED(nb);
+    UNUSED(ncols_interleaved);
+    UNUSED(blocklen);
+
+    const vint8mf2_t values = __riscv_vle8_v_i8mf2(kvalues_iq4nl, 16);
+    for (int y = 0; y < nr / 4; y++) {
+        const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (y * nb);
+        for (int x = 0; x < nc / ncols_interleaved; x++) {
+            const block_iq4_nlx64 * b_ptr = (const block_iq4_nlx64 *) vx + (x * nb);
+
+            // 4x16 Accumulators
+            vfloat32m2_t sumf_0 = __riscv_vfmv_v_f_f32m2(0.0f, 64);
+            vfloat32m2_t sumf_1 = __riscv_vfmv_v_f_f32m2(0.0f, 64);
+            vfloat32m2_t sumf_2 = __riscv_vfmv_v_f_f32m2(0.0f, 64);
+            vfloat32m2_t sumf_3 = __riscv_vfmv_v_f_f32m2(0.0f, 64);
+
+            for (int l = 0; l < nb; l++) {
+                // 4x16 integer accumulators
+                vint32m2_t sumi_0 = __riscv_vmv_v_x_i32m2(0.0f, 64);
+                vint32m2_t sumi_1 = __riscv_vmv_v_x_i32m2(0.0f, 64);
+                vint32m2_t sumi_2 = __riscv_vmv_v_x_i32m2(0.0f, 64);
+                vint32m2_t sumi_3 = __riscv_vmv_v_x_i32m2(0.0f, 64);
+
+                // Accumulation loop.
+                for (int i = 0; i < QK4_NL / 2; i++) {
+                    // Load `b_ptr`.
+                    const vuint8mf2_t b_0_packed = __riscv_vle8_v_u8mf2((const uint8_t *)&b_ptr[l].qs[i * 64], 64);
+                    const vint8mf2_t b_0_lo = __riscv_vrgather_vv_i8mf2(values, __riscv_vand_vx_u8mf2(b_0_packed, 0xf, 64), 64);
+                    const vint8mf2_t b_0_hi = __riscv_vrgather_vv_i8mf2(values, __riscv_vsrl_vx_u8mf2(b_0_packed, 4, 64), 64);
+                    // const vint16m1_t b_0_lo_16 = __riscv_vwcvt_x_x_v_i16m1(b_0_lo, 64);
+                    // const vint16m1_t b_0_hi_16 = __riscv_vwcvt_x_x_v_i16m1(b_0_hi, 64);
+
+                    const vint16m1_t sumi_0_lo = __riscv_vwmul_vx_i16m1(b_0_lo, a_ptr[l].qs[i * 4], 64);
+                    const vint16m1_t sumi_1_lo = __riscv_vwmul_vx_i16m1(b_0_lo, a_ptr[l].qs[i * 4 + 1], 64);
+                    const vint16m1_t sumi_2_lo = __riscv_vwmul_vx_i16m1(b_0_lo, a_ptr[l].qs[i * 4 + 2], 64);
+                    const vint16m1_t sumi_3_lo = __riscv_vwmul_vx_i16m1(b_0_lo, a_ptr[l].qs[i * 4 + 3], 64);
+
+                    const vint16m1_t sumi_0_hi = __riscv_vwmul_vx_i16m1(b_0_hi, a_ptr[l].qs[64 + i * 4], 64);
+                    const vint16m1_t sumi_1_hi = __riscv_vwmul_vx_i16m1(b_0_hi, a_ptr[l].qs[64 + i * 4 + 1], 64);
+                    const vint16m1_t sumi_2_hi = __riscv_vwmul_vx_i16m1(b_0_hi, a_ptr[l].qs[64 + i * 4 + 2], 64);
+                    const vint16m1_t sumi_3_hi = __riscv_vwmul_vx_i16m1(b_0_hi, a_ptr[l].qs[64 + i * 4 + 3], 64);
+
+                    sumi_0 = __riscv_vadd_vv_i32m2(sumi_0, __riscv_vwadd_vv_i32m2(sumi_0_lo, sumi_0_hi, 64), 64);
+                    sumi_1 = __riscv_vadd_vv_i32m2(sumi_1, __riscv_vwadd_vv_i32m2(sumi_1_lo, sumi_1_hi, 64), 64);
+                    sumi_2 = __riscv_vadd_vv_i32m2(sumi_2, __riscv_vwadd_vv_i32m2(sumi_2_lo, sumi_2_hi, 64), 64);
+                    sumi_3 = __riscv_vadd_vv_i32m2(sumi_3, __riscv_vwadd_vv_i32m2(sumi_3_lo, sumi_3_hi, 64), 64);
+                }
+
+                const vfloat16m1_t b_d = __riscv_vle16_v_f16m1((const _Float16 *)b_ptr[l].d, 64);
+                const vfloat32m2_t d_0 = __riscv_vfwmul_vf_f32m2(b_d, *(const _Float16 *)&a_ptr[l].d[0], 64);
+                const vfloat32m2_t d_1 = __riscv_vfwmul_vf_f32m2(b_d, *(const _Float16 *)&a_ptr[l].d[1], 64);
+                const vfloat32m2_t d_2 = __riscv_vfwmul_vf_f32m2(b_d, *(const _Float16 *)&a_ptr[l].d[2], 64);
+                const vfloat32m2_t d_3 = __riscv_vfwmul_vf_f32m2(b_d, *(const _Float16 *)&a_ptr[l].d[3], 64);
+
+                sumf_0 = __riscv_vfmacc_vv_f32m2(sumf_0, __riscv_vfcvt_f_x_v_f32m2(sumi_0, 64), d_0, 64);
+                sumf_1 = __riscv_vfmacc_vv_f32m2(sumf_1, __riscv_vfcvt_f_x_v_f32m2(sumi_1, 64), d_1, 64);
+                sumf_2 = __riscv_vfmacc_vv_f32m2(sumf_2, __riscv_vfcvt_f_x_v_f32m2(sumi_2, 64), d_2, 64);
+                sumf_3 = __riscv_vfmacc_vv_f32m2(sumf_3, __riscv_vfcvt_f_x_v_f32m2(sumi_3, 64), d_3, 64);
+            }
+
+            __riscv_vse32_v_f32m2(s + (y * 4 + 0) * bs + x * 64, sumf_0, 64);
+            __riscv_vse32_v_f32m2(s + (y * 4 + 1) * bs + x * 64, sumf_1, 64);
+            __riscv_vse32_v_f32m2(s + (y * 4 + 2) * bs + x * 64, sumf_2, 64);
+            __riscv_vse32_v_f32m2(s + (y * 4 + 3) * bs + x * 64, sumf_3, 64);
+        }
+    }
+}
+
+void ggml_gemm_iq4_nl_16x1_v1024_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int qk = QK8_0;
+    const int nb = n / qk;
+    const int ncols_interleaved = 16;
+    const int blocklen = 1;
+
+    assert (n % qk == 0);
+    assert (nr % 4 == 0);
+    assert (nc % ncols_interleaved == 0);
+
+    UNUSED(s);
+    UNUSED(bs);
+    UNUSED(vx);
+    UNUSED(vy);
+    UNUSED(nr);
+    UNUSED(nc);
+    UNUSED(nb);
+    UNUSED(ncols_interleaved);
+    UNUSED(blocklen);
+
+    const vint8mf8_t values = __riscv_vle8_v_i8mf8(kvalues_iq4nl, 16);
+    for (int y = 0; y < nr / 4; y++) {
+        const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (y * nb);
+        for (int x = 0; x < nc / ncols_interleaved; x++) {
+            const block_iq4_nlx16 * b_ptr = (const block_iq4_nlx16 *) vx + (x * nb);
+
+            // 4x16 Accumulators
+            vfloat32mf2_t sumf_0 = __riscv_vfmv_v_f_f32mf2(0.0f, 16);
+            vfloat32mf2_t sumf_1 = __riscv_vfmv_v_f_f32mf2(0.0f, 16);
+            vfloat32mf2_t sumf_2 = __riscv_vfmv_v_f_f32mf2(0.0f, 16);
+            vfloat32mf2_t sumf_3 = __riscv_vfmv_v_f_f32mf2(0.0f, 16);
+
+            for (int l = 0; l < nb; l++) {
+                // 4x16 integer accumulators
+                vint32mf2_t sumi_0 = __riscv_vmv_v_x_i32mf2(0.0f, 16);
+                vint32mf2_t sumi_1 = __riscv_vmv_v_x_i32mf2(0.0f, 16);
+                vint32mf2_t sumi_2 = __riscv_vmv_v_x_i32mf2(0.0f, 16);
+                vint32mf2_t sumi_3 = __riscv_vmv_v_x_i32mf2(0.0f, 16);
+
+                // Accumulation loop.
+                for (int i = 0; i < QK4_NL / 2; i++) {
+                    // Load `b_ptr`.
+                    const vuint8mf8_t b_0_packed = __riscv_vle8_v_u8mf8((const uint8_t *)&b_ptr[l].qs[i * 16], 16);
+                    const vint8mf8_t b_0_lo = __riscv_vrgather_vv_i8mf8(values, __riscv_vand_vx_u8mf8(b_0_packed, 0xf, 16), 16);
+                    const vint8mf8_t b_0_hi = __riscv_vrgather_vv_i8mf8(values, __riscv_vsrl_vx_u8mf8(b_0_packed, 4, 16), 16);
+                    // const vint16mf4_t b_0_lo_16 = __riscv_vwcvt_x_x_v_i16mf4(b_0_lo, 16);
+                    // const vint16mf4_t b_0_hi_16 = __riscv_vwcvt_x_x_v_i16mf4(b_0_hi, 16);
+
+                    const vint16mf4_t sumi_0_lo = __riscv_vwmul_vx_i16mf4(b_0_lo, a_ptr[l].qs[i * 4], 16);
+                    const vint16mf4_t sumi_1_lo = __riscv_vwmul_vx_i16mf4(b_0_lo, a_ptr[l].qs[i * 4 + 1], 16);
+                    const vint16mf4_t sumi_2_lo = __riscv_vwmul_vx_i16mf4(b_0_lo, a_ptr[l].qs[i * 4 + 2], 16);
+                    const vint16mf4_t sumi_3_lo = __riscv_vwmul_vx_i16mf4(b_0_lo, a_ptr[l].qs[i * 4 + 3], 16);
+
+                    const vint16mf4_t sumi_0_hi = __riscv_vwmul_vx_i16mf4(b_0_hi, a_ptr[l].qs[64 + i * 4], 16);
+                    const vint16mf4_t sumi_1_hi = __riscv_vwmul_vx_i16mf4(b_0_hi, a_ptr[l].qs[64 + i * 4 + 1], 16);
+                    const vint16mf4_t sumi_2_hi = __riscv_vwmul_vx_i16mf4(b_0_hi, a_ptr[l].qs[64 + i * 4 + 2], 16);
+                    const vint16mf4_t sumi_3_hi = __riscv_vwmul_vx_i16mf4(b_0_hi, a_ptr[l].qs[64 + i * 4 + 3], 16);
+
+                    sumi_0 = __riscv_vadd_vv_i32mf2(sumi_0, __riscv_vwadd_vv_i32mf2(sumi_0_lo, sumi_0_hi, 16), 16);
+                    sumi_1 = __riscv_vadd_vv_i32mf2(sumi_1, __riscv_vwadd_vv_i32mf2(sumi_1_lo, sumi_1_hi, 16), 16);
+                    sumi_2 = __riscv_vadd_vv_i32mf2(sumi_2, __riscv_vwadd_vv_i32mf2(sumi_2_lo, sumi_2_hi, 16), 16);
+                    sumi_3 = __riscv_vadd_vv_i32mf2(sumi_3, __riscv_vwadd_vv_i32mf2(sumi_3_lo, sumi_3_hi, 16), 16);
+                }
+
+                const vfloat16mf4_t b_d = __riscv_vle16_v_f16mf4((const _Float16 *)b_ptr[l].d, 16);
+                const vfloat32mf2_t d_0 = __riscv_vfwmul_vf_f32mf2(b_d, *(const _Float16 *)&a_ptr[l].d[0], 16);
+                const vfloat32mf2_t d_1 = __riscv_vfwmul_vf_f32mf2(b_d, *(const _Float16 *)&a_ptr[l].d[1], 16);
+                const vfloat32mf2_t d_2 = __riscv_vfwmul_vf_f32mf2(b_d, *(const _Float16 *)&a_ptr[l].d[2], 16);
+                const vfloat32mf2_t d_3 = __riscv_vfwmul_vf_f32mf2(b_d, *(const _Float16 *)&a_ptr[l].d[3], 16);
+
+                sumf_0 = __riscv_vfmacc_vv_f32mf2(sumf_0, __riscv_vfcvt_f_x_v_f32mf2(sumi_0, 16), d_0, 16);
+                sumf_1 = __riscv_vfmacc_vv_f32mf2(sumf_1, __riscv_vfcvt_f_x_v_f32mf2(sumi_1, 16), d_1, 16);
+                sumf_2 = __riscv_vfmacc_vv_f32mf2(sumf_2, __riscv_vfcvt_f_x_v_f32mf2(sumi_2, 16), d_2, 16);
+                sumf_3 = __riscv_vfmacc_vv_f32mf2(sumf_3, __riscv_vfcvt_f_x_v_f32mf2(sumi_3, 16), d_3, 16);
+            }
+
+            __riscv_vse32_v_f32mf2(s + (y * 4 + 0) * bs + x * 16, sumf_0, 16);
+            __riscv_vse32_v_f32mf2(s + (y * 4 + 1) * bs + x * 16, sumf_1, 16);
+            __riscv_vse32_v_f32mf2(s + (y * 4 + 2) * bs + x * 16, sumf_2, 16);
+            __riscv_vse32_v_f32mf2(s + (y * 4 + 3) * bs + x * 16, sumf_3, 16);
+        }
+    }
+}
+
 void ggml_gemm_iq4_nl_16x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    if (__riscv_vlenb() == 128) {
+        ggml_gemm_iq4_nl_16x1_v1024_q8_0(n, s, bs, vx, vy, nr, nc);
+        return;
+    }
     const int qk = QK8_0;
     const int nb = n / qk;
     const int ncols_interleaved = 16;
