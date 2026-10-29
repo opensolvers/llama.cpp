@@ -462,7 +462,13 @@ void ggml_gemv_iq4_nl_64x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const
     UNUSED(ncols_interleaved);
     UNUSED(blocklen);
 
-    const vint8mf2_t values = __riscv_vle8_v_i8mf2(kvalues_iq4nl, 16);
+    // The 16-entry LUT is gathered with a 64-lane mf2 register. Repeat it in
+    // every 16-lane slice so a slice-local vrgather still reads the table.
+    int8_t iq4_lut[64];
+    for (int li = 0; li < 64; ++li) {
+        iq4_lut[li] = kvalues_iq4nl[li & 15];
+    }
+    const vint8mf2_t values = __riscv_vle8_v_i8mf2(iq4_lut, 64);
     const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
     for (int x = 0; x < nc / ncols_interleaved; x++) {
         const block_iq4_nlx64 * b_ptr = (const block_iq4_nlx64 *) vx + (x * nb);
@@ -1523,7 +1529,13 @@ void ggml_gemm_iq4_nl_64x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const
     UNUSED(ncols_interleaved);
     UNUSED(blocklen);
 
-    const vint8mf2_t values = __riscv_vle8_v_i8mf2(kvalues_iq4nl, 16);
+    // The 16-entry LUT is gathered with a 64-lane mf2 register. Repeat it in
+    // every 16-lane slice so a slice-local vrgather still reads the table.
+    int8_t iq4_lut[64];
+    for (int li = 0; li < 64; ++li) {
+        iq4_lut[li] = kvalues_iq4nl[li & 15];
+    }
+    const vint8mf2_t values = __riscv_vle8_v_i8mf2(iq4_lut, 64);
     for (int y = 0; y < nr / 4; y++) {
         const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (y * nb);
         for (int x = 0; x < nc / ncols_interleaved; x++) {

@@ -5234,7 +5234,11 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
                 case 128:  { break; } // TODO
                 case 256:  { if (cur->ne[1] % 16 == 0) { return &iq4_nl_16x1_q8_0; } break; }
                 case 512:  { break; } // TODO
-                case 1024: { if (cur->ne[1] % 16 == 0) { return &iq4_nl_16x1_q8_0; } break; }
+                case 1024: {
+                    if (cur->ne[1] % 64 == 0) { return &iq4_nl_64x1_q8_0; }
+                    if (cur->ne[1] % 16 == 0) { return &iq4_nl_16x1_q8_0; }
+                    break;
+                }
                 default:   { return nullptr; }
             }
             #endif
