@@ -1768,6 +1768,54 @@ static int repack_q5_k_to_q5_1_32_bl(ggml_tensor *              t,
     return 0;
 }
 
+
+// Expand IQ4_NL codes through kvalues_iq4nl into the Q8_0 x32 tile the IME2
+// i8i8 vmadot kernel already consumes. Low nibble is element j, high nibble
+// is element j+16, matching ggml_vec_dot_iq4_nl_q8_0.
+static int repack_iq4_nl_to_q8_0_32_bl(ggml_tensor *              t,
+                                       int                        interleave_block,
+                                       const void * GGML_RESTRICT data,
+                                       size_t                     data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_IQ4_NL);
+    GGML_ASSERT(interleave_block == 32);
+    static_assert(QK4_NL == QK8_0, "IQ4_NL and Q8_0 blocks must cover the same K");
+
+    constexpr int nrows_interleaved = 32;
+
+    block_q8_0x32 *      dst = (block_q8_0x32 *) t->data;
+    const block_iq4_nl * src = (const block_iq4_nl *) data;
+    block_q8_0           dst_tmp[32];
+    int                  nrow    = ggml_nrows(t);
+    int                  nblocks = t->ne[0] / QK4_NL;
+
+    GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_iq4_nl));
+
+    if (t->ne[0] % QK4_NL != 0) {
+        return -1;
+    }
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        int64_t nrows_real = std::min((int64_t) nrow - b, (int64_t) nrows_interleaved);
+        for (int64_t x = 0; x < nblocks; x++) {
+            int i = 0;
+            for (; i < nrows_real; i++) {
+                const block_iq4_nl & s = src[x + i * nblocks];
+                dst_tmp[i].d = s.d;
+                for (int j = 0; j < QK4_NL / 2; j++) {
+                    dst_tmp[i].qs[j]              = kvalues_iq4nl[s.qs[j] & 0x0F];
+                    dst_tmp[i].qs[j + QK4_NL / 2] = kvalues_iq4nl[s.qs[j] >> 4];
+                }
+            }
+            for (; i < nrows_interleaved; i++) {
+                memset(&dst_tmp[i], 0, sizeof(block_q8_0));
+            }
+            *dst++ = make_block_q8_0x32(dst_tmp, interleave_block);
+        }
+        src += nrows_interleaved * nblocks;
+    }
+    return 0;
+}
+
 namespace ggml::cpu::riscv64_spacemit {
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> int repack(ggml_tensor *, const void *, size_t);
@@ -1862,6 +1910,10 @@ template <> int repack<block_q5_1, 32, 32>(ggml_tensor * t, const void * data, s
 
 template <> int repack<block_q5_K, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
     return repack_q5_k_to_q5_1_32_bl(t, 32, data, data_size);
+}
+
+template <> int repack<block_iq4_nl, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_iq4_nl_to_q8_0_32_bl(t, 32, data, data_size);
 }
 
 }  // namespace ggml::cpu::riscv64_spacemit
