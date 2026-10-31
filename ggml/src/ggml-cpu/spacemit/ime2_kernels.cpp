@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <stdexcept>
 
 #if !defined(__riscv_v) || !defined(__riscv_v_intrinsic)
@@ -2028,405 +2030,6 @@ void gemm_kernel_i8i3k_m1(size_t          blk_len,
               [a_post_mul] "f"(k_a_scale_post_mul)
             : "cc", "memory", "t0", "t2", "t3", "t4", "t5", "f0", "f1", "s2", "s3", "s4", "s5", "s6", "s7", "s8");
 #endif
-    }
-}
-
-void gemm_kernel_i8i3k_m4(size_t          blk_len,
-                          const uint8_t * quant_a_ptr,
-                          const uint8_t * quant_b_data,
-                          float *         c_ptr,
-                          size_t          count_m,
-                          size_t          count_n,
-                          size_t          k_blks,
-                          size_t          ldc) {
-    using blk_type           = nrow_block_q3_k<32>;
-    constexpr size_t NB_COLS = 32;  //only support 32 in ASM
-
-    const blk_type * b_base = reinterpret_cast<const blk_type *>(quant_b_data);
-
-    int64_t a_blk_stride        = q8k_blk_size(256);
-    int64_t a_nrow_block_stride = a_blk_stride * 4;
-    int64_t b_ncol_block_stride = sizeof(blk_type);
-
-    for (size_t ni = 0; ni < count_n; ni += NB_COLS, c_ptr += NB_COLS) {
-        size_t           nb_real          = std::min<size_t>(NB_COLS, count_n - ni);
-        const blk_type * quant_b_blk_data = b_base + (ni / NB_COLS) * k_blks;
-
-        //------------------------------------------------------------------------------
-        // A format
-        // Ascale   fp32 * 1* 4row    128bit
-        // Asum     int16 * 16 4row  1024bit
-        // A M1K256 int8 4row        8192bit
-        //------------------------------------------------------------------------------
-        // B format
-        // B_scl    uint8*N32*16    4096bit
-        // B_Hmask  N32K16*16 1bit  8192bit
-        // B_Qs     N32K16*16 2bit  16384bit
-        // B scl16  fp16 * N32      512bit;
-        //------------------------------------------------------------------------------
-        //bias always be nullptr
-        __asm__ volatile(
-            // t2 = k_blks (each is K256 superblock)
-            "mv           t2, %[KBLKS]            \n\t"
-            // t3 = 256/64 = 4 (K64 iterations per superblock)
-            "li           t3, 4                   \n\t"
-            "mv           s2, %[pA]               \n\t"  // s2 = pASCL
-            "addi         s3, %[pA], 16+128       \n\t"  // s3 = pAData, (pA+AScl+ASum)
-
-            // B block layout for nrow_block_q3_k<32>:
-            // scales: 512B, hmask: 1024B, qs: 2048B, scales16: 64B
-            "addi         s5, %[pB], 32*16        \n\t"  // s5 = pB_hmask (skip scales)
-            "mv           s4, %[pB]               \n\t"  // s4 = pB_scales
-            "addi         s6, s5, 1024            \n\t"  // s6 = pB_qs (skip hmask)
-            "mv           s7, %[pB]               \n\t"  // s7 = pB_base
-
-            "vsetvli      t0, x0, e32, m1         \n\t"
-            "vxor.vv      v24, v0, v0             \n\t"  // v24-v27: K256 temp accumulator
-            "vxor.vv      v25, v0, v0             \n\t"
-            "vxor.vv      v26, v0, v0             \n\t"
-            "vxor.vv      v27, v0, v0             \n\t"
-            "vxor.vv      v28, v0, v0             \n\t"  // v28-v31: final accumulator
-            "vxor.vv      v29, v0, v0             \n\t"
-            "vxor.vv      v30, v0, v0             \n\t"
-            "vxor.vv      v31, v0, v0             \n\t"
-
-            // ordinary vmadot: vle*13 vecIns*96 vmadot*16
-            ".align 4                             \n\t"
-            "BLK_LPST%=:                          \n\t"
-            "K64_LPST%=:                          \n\t"
-
-            // ========== K0-15: First K16 sub-block ==========
-            // Load B INT8 scale factors (32 cols × 16 K16 blocks)
-            "vsetvli      t0, x0, e8, m1          \n\t"
-            "vle8.v       v8, (s4)                \n\t"
-            "addi         s4, s4, 128             \n\t"
-
-            // Load B quantized data (32 cols × 16 elements × 2bit, stored in 4 groups)
-            "vle8.v       v4, (s6)                \n\t"
-            "addi         s6, s6, 128             \n\t"
-            "vle8.v       v5, (s6)                \n\t"
-            "addi         s6, s6, 128             \n\t"
-            "vle8.v       v6, (s6)                \n\t"
-            "addi         s6, s6, 128             \n\t"
-            "vle8.v       v7, (s6)                \n\t"
-            "addi         s6, s6, 128             \n\t"
-
-            // Load B hmask (32 cols × 16bit sign mask)
-            "vsetvli      t0, x0, e8, mf2         \n\t"
-            "vle8.v       v0, (s5)                \n\t"
-            "addi         s5, s5, 64              \n\t"
-
-            // Load A data (4 rows × 16 elements × INT8)
-            "vsetvli      t0, x0, e8, mf2         \n\t"
-            "vle8.v       v12, (s3)               \n\t"
-            "addi         s3, s3, 256             \n\t"  // Jump to next row
-            "vle8.v       v13, (s3)               \n\t"
-            "addi         s3, s3, 256             \n\t"
-            "vle8.v       v14, (s3)               \n\t"
-            "addi         s3, s3, 256             \n\t"
-            "vle8.v       v15, (s3)               \n\t"
-            "addi         s3, s3, -768+64         \n\t"  // Back to first row, advance 16 elements
-
-            // Pack A data: merge 4 rows into 2 vectors
-            "vsetvli      t0, x0, e8, m1          \n\t"
-            "vpack.vv     v16, v12, v13, 1        \n\t"
-            "vpack.vv     v18, v14, v15, 1        \n\t"
-            "vpack.vv     v2, v16, v18, 2         \n\t"
-
-            // unpack 2-bit qs + hmask -> signed values
-            "vsetvli      t0, x0, e8, m1          \n\t"
-            "vnot.v       v0, v0                  \n\t"
-            "vand.vi      v12, v4, 0x3            \n\t"
-            "vand.vi      v13, v5, 0x3            \n\t"
-            "vand.vi      v14, v6, 0x3            \n\t"
-            "vand.vi      v15, v7, 0x3            \n\t"
-
-            "vsetvli      t0, x0, e8, m4          \n\t"
-            "vadd.vi      v12, v12, -4, v0.t      \n\t"
-
-            "vsetvli      t0, x0, e32, m1         \n\t"
-            "vxor.vv      v16, v16, v16           \n\t"
-            "vxor.vv      v18, v16, v16           \n\t"
-            "vxor.vv      v20, v16, v16           \n\t"
-            "vxor.vv      v22, v16, v16           \n\t"
-
-            "vmadot       v16, v2, v12, i8        \n\t"  // 4 rows × cols 0-7
-            "vmadot       v18, v2, v13, i8        \n\t"  // 4 rows × cols 8-15
-            "vmadot       v20, v2, v14, i8        \n\t"  // 4 rows × cols 16-23
-            "vmadot       v22, v2, v15, i8        \n\t"  // 4 rows × cols 24-31
-
-            "vsetvli      t0, x0, e16, m1         \n\t"
-            "vpack.vv     v12, v16, v18, 2        \n\t"  // Merge cols 0-15
-            "vpack.vv     v14, v20, v22, 2        \n\t"  // Merge cols 16-31
-            "vpack.vv     v16, v12, v14, 3        \n\t"  // Inter-row results (INT16)
-            "vpack.vv     v18, v13, v15, 3        \n\t"
-
-            // apply B int8 scales (-32 bias has been applyed)
-            "vsetvli      t0, x0, e8, mf4         \n\t"
-            "vwadd.vx     v21, v8, x0             \n\t"  // INT8 → INT16
-
-            "vsetvli      t0, x0, e16, mf2        \n\t"
-            "vwadd.vx     v23, v21, x0            \n\t"  // INT16 → INT32
-
-            // Accumulate to K256 accumulator: qsum * b_scale
-            "vsetvli      t0, x0, e32, m1         \n\t"
-            "vmacc.vv     v24, v16, v23           \n\t"  // Row 0
-            "vmacc.vv     v25, v17, v23           \n\t"  // Row 1
-            "vmacc.vv     v26, v18, v23           \n\t"  // Row 2
-            "vmacc.vv     v27, v19, v23           \n\t"
-
-            // ========== K16-31, K32-47, K48-63: Similar processing ==========
-            // load B scales (32 bytes per K16, 16 times => 512B)
-            "vsetvli      t0, x0, e64, m1         \n\t"
-            "vslidedown.vi  v8, v8, 4             \n\t"
-
-            // load B hmask chunk (64B per K16, 16 times => 1024B)
-            "vsetvli      t0, x0, e8, mf2         \n\t"
-            "vle8.v       v0, (s5)                \n\t"
-            "addi         s5, s5, 64              \n\t"
-
-            // load A data (16 bytes per K16, 16 times => 256B)
-            "vsetvli      t0, x0, e64, m1         \n\t"
-            "vslidedown.vi  v2, v2, 8             \n\t"
-
-            // unpack 2-bit qs + hmask -> signed values
-            "vsetvli      t0, x0, e8, m1          \n\t"
-            "vsll.vi      v12, v4, 4              \n\t"
-            "vsll.vi      v13, v5, 4              \n\t"
-            "vsll.vi      v14, v6, 4              \n\t"
-            "vsll.vi      v15, v7, 4              \n\t"
-            "vnot.v       v0, v0                  \n\t"
-
-            "vsrl.vi      v12, v12, 6             \n\t"
-            "vsrl.vi      v13, v13, 6             \n\t"
-            "vsrl.vi      v14, v14, 6             \n\t"
-            "vsrl.vi      v15, v15, 6             \n\t"
-
-            "vsetvli      t0, x0, e8, m4          \n\t"
-            "vadd.vi      v12, v12, -4, v0.t      \n\t"
-
-            "vsetvli      t0, x0, e32, m1         \n\t"
-            "vxor.vv      v16, v16, v16           \n\t"
-            "vxor.vv      v18, v16, v16           \n\t"
-            "vxor.vv      v20, v16, v16           \n\t"
-            "vxor.vv      v22, v16, v16           \n\t"
-
-            "vmadot       v16, v2, v12, i8        \n\t"
-            "vmadot       v18, v2, v13, i8        \n\t"
-            "vmadot       v20, v2, v14, i8        \n\t"
-            "vmadot       v22, v2, v15, i8        \n\t"
-
-            "vsetvli      t0, x0, e16, m1         \n\t"
-            "vpack.vv     v12, v16, v18, 2        \n\t"
-            "vpack.vv     v14, v20, v22, 2        \n\t"
-            "vpack.vv     v16, v12, v14, 3        \n\t"  // N0-N31 in v16
-            "vpack.vv     v18, v13, v15, 3        \n\t"
-
-            // apply B int8 scales (-32 bias has been applyed)
-            "vsetvli      t0, x0, e8, mf4         \n\t"
-            "vwadd.vx     v21, v8, x0             \n\t"  // int8 -> int16
-
-            "vsetvli      t0, x0, e16, mf2        \n\t"
-            "vwadd.vx     v23, v21, x0            \n\t"  // int8 -> int16
-
-            // static_cast<int32_t>(qsum) * b_scale;
-            "vsetvli      t0, x0, e32, m1         \n\t"
-            "vmacc.vv     v24, v16, v23           \n\t"
-            "vmacc.vv     v25, v17, v23           \n\t"
-            "vmacc.vv     v26, v18, v23           \n\t"
-            "vmacc.vv     v27, v19, v23           \n\t"
-
-            //K32-47
-            // load B scales (32 bytes per K16, 16 times => 512B)
-            "vsetvli      t0, x0, e64, m1         \n\t"
-            "vslidedown.vi  v8, v8, 4             \n\t"
-
-            // load B hmask chunk (64B per K16, 16 times => 1024B)
-            "vsetvli      t0, x0, e8, mf2         \n\t"
-            "vle8.v       v0, (s5)                \n\t"
-            "addi         s5, s5, 64              \n\t"
-
-            // load A data (16 bytes per K16, 16 times => 256B)
-
-            // unpack 2-bit qs + hmask -> signed values
-            "vsetvli      t0, x0, e8, m1          \n\t"
-            "vsll.vi      v12, v4, 2              \n\t"
-            "vsll.vi      v13, v5, 2              \n\t"
-            "vsll.vi      v14, v6, 2              \n\t"
-            "vsll.vi      v15, v7, 2              \n\t"
-            "vnot.v       v0, v0                  \n\t"
-
-            "vsrl.vi      v12, v12, 6             \n\t"
-            "vsrl.vi      v13, v13, 6             \n\t"
-            "vsrl.vi      v14, v14, 6             \n\t"
-            "vsrl.vi      v15, v15, 6             \n\t"
-
-            "vsetvli      t0, x0, e8, m4          \n\t"
-            "vadd.vi      v12, v12, -4, v0.t      \n\t"
-
-            "vsetvli      t0, x0, e32, m1         \n\t"
-            "vxor.vv      v16, v16, v16           \n\t"
-            "vxor.vv      v18, v16, v16           \n\t"
-            "vxor.vv      v20, v16, v16           \n\t"
-            "vxor.vv      v22, v16, v16           \n\t"
-
-            "vmadot       v16, v3, v12, i8        \n\t"
-            "vmadot       v18, v3, v13, i8        \n\t"
-            "vmadot       v20, v3, v14, i8        \n\t"
-            "vmadot       v22, v3, v15, i8        \n\t"
-
-            "vsetvli      t0, x0, e16, m1         \n\t"
-            "vpack.vv     v12, v16, v18, 2        \n\t"
-            "vpack.vv     v14, v20, v22, 2        \n\t"
-            "vpack.vv     v16, v12, v14, 3        \n\t"  // N0-N31 in v16
-            "vpack.vv     v18, v13, v15, 3        \n\t"
-
-            // apply B int8 scales (-32 bias has been applyed)
-            "vsetvli      t0, x0, e8, mf4         \n\t"
-            "vwadd.vx     v21, v8, x0             \n\t"  // int8 -> int16
-
-            "vsetvli      t0, x0, e16, mf2        \n\t"
-            "vwadd.vx     v23, v21, x0            \n\t"  // int8 -> int16
-
-            // static_cast<int32_t>(qsum) * b_scale;
-            "vsetvli      t0, x0, e32, m1         \n\t"
-            "vmacc.vv     v24, v16, v23           \n\t"
-            "vmacc.vv     v25, v17, v23           \n\t"
-            "vmacc.vv     v26, v18, v23           \n\t"
-            "vmacc.vv     v27, v19, v23           \n\t"
-
-            // K48-63
-            // load B scales (32 bytes per K16, 16 times => 512B)
-            "vsetvli      t0, x0, e64, m1         \n\t"
-            "vslidedown.vi  v8, v8, 4             \n\t"
-
-            // load B hmask chunk (64B per K16, 16 times => 1024B)
-            "vsetvli      t0, x0, e8, mf2         \n\t"
-            "vle8.v       v0, (s5)                \n\t"
-            "addi         s5, s5, 64              \n\t"
-
-            // load A data (16 bytes per K16, 16 times => 256B)
-            "vsetvli      t0, x0, e64, m1         \n\t"
-            "vslidedown.vi  v3, v3, 8             \n\t"
-
-            "vsetvli      t0, x0, e8, m1          \n\t"
-            "vnot.v       v0, v0                  \n\t"
-            "vsrl.vi      v12, v4, 6              \n\t"
-            "vsrl.vi      v13, v5, 6              \n\t"
-            "vsrl.vi      v14, v6, 6              \n\t"
-            "vsrl.vi      v15, v7, 6              \n\t"
-
-            "vsetvli      t0, x0, e8, m4          \n\t"
-            "vadd.vi      v12, v12, -4, v0.t      \n\t"
-
-            "vsetvli      t0, x0, e32, m1         \n\t"
-            "vxor.vv      v16, v16, v16           \n\t"
-            "vxor.vv      v18, v16, v16           \n\t"
-            "vxor.vv      v20, v16, v16           \n\t"
-            "vxor.vv      v22, v16, v16           \n\t"
-
-            "vmadot       v16, v3, v12, i8        \n\t"
-            "vmadot       v18, v3, v13, i8        \n\t"
-            "vmadot       v20, v3, v14, i8        \n\t"
-            "vmadot       v22, v3, v15, i8        \n\t"
-
-            "vsetvli      t0, x0, e16, m1         \n\t"
-            "vpack.vv     v12, v16, v18, 2        \n\t"
-            "vpack.vv     v14, v20, v22, 2        \n\t"
-            "vpack.vv     v16, v12, v14, 3        \n\t"  // N0-N31 in v16
-            "vpack.vv     v18, v13, v15, 3        \n\t"
-
-            // apply B int8 scales (-32 bias has been applyed)
-            "vsetvli      t0, x0, e8, mf4         \n\t"
-            "vwadd.vx     v21, v8, x0             \n\t"  // int8 -> int16
-
-            "vsetvli      t0, x0, e16, mf2        \n\t"
-            "vwadd.vx     v23, v21, x0            \n\t"  // int8 -> int16
-
-            // static_cast<int32_t>(qsum) * b_scale;
-            "vsetvli      t0, x0, e32, m1         \n\t"
-            "vmacc.vv     v24, v16, v23           \n\t"
-            "vmacc.vv     v25, v17, v23           \n\t"
-            "vmacc.vv     v26, v18, v23           \n\t"
-            "vmacc.vv     v27, v19, v23           \n\t"
-
-            "addi         t3, t3, -1              \n\t"
-            "bgtz         t3, K64_LPST%=          \n\t"
-            "K64_LPND%=:                          \n\t"
-
-            // ========== K256 superblock complete, apply scale factors ==========
-            // Load A's 4 row scale factors (FP32)
-            "flw          f0, (s2)                \n\t"
-            "flw          f1, 4(s2)               \n\t"
-            "flw          f2, 8(s2)               \n\t"
-            "flw          f3, 12(s2)              \n\t"
-            "add          s2, s2, %[A_STR]        \n\t"  // Advance to next superblock
-            "add          t4, s7, %[B_STR]        \n\t"  // t4 = next B block address
-            "addi         s3, s2, (4+32)*4        \n\t"
-
-            // Load B FP16 global scale factors (32 cols)
-            "vsetvli      t0, x0, e16, mf2        \n\t"
-            "vle16.v      v8, (s6)                \n\t"
-
-            // Update B pointers to next block
-            "addi         s5, t4, 32*16           \n\t"
-            "mv           s4, t4                  \n\t"
-            "addi         s6, s5, 32*32           \n\t"
-            "addi         s7, t4, 0               \n\t"
-
-            // ========== Type conversion and final scaling ==========
-            // FP16 → FP32
-            "vsetvli      t0, x0, e16, mf2        \n\t"
-            "vfwcvt.f.f.v v9, v8                 \n\t"
-
-            // INT32 → FP32
-            "vsetvli      t0, x0, e32, m1         \n\t"
-            "vfcvt.f.x.v  v24, v24                \n\t"
-            "vfcvt.f.x.v  v25, v25                \n\t"
-            "vfcvt.f.x.v  v26, v26                \n\t"
-            "vfcvt.f.x.v  v27, v27                \n\t"
-
-            // Compute a_scale * b_scale (4 rows)
-            "vfmul.vf     v12, v9, f0             \n\t"
-            "vfmul.vf     v13, v9, f1             \n\t"
-            "vfmul.vf     v14, v9, f2             \n\t"
-            "vfmul.vf     v15, v9, f3             \n\t"
-
-            // Final accumulation: result += qsum * a_scale * b_scale
-            "vsetvli      t0, x0, e32, m1         \n\t"
-            "vfmacc.vv    v28, v12, v24           \n\t"
-            "vfmacc.vv    v29, v13, v25           \n\t"
-            "vfmacc.vv    v30, v14, v26           \n\t"
-            "vfmacc.vv    v31, v15, v27           \n\t"
-
-            // Prepare for next K superblock
-            "addi         t2, t2, -1              \n\t"
-            "vxor.vv      v24, v0, v0             \n\t"  // Clear K256 accumulator
-            "vxor.vv      v25, v0, v0             \n\t"
-            "vxor.vv      v26, v0, v0             \n\t"
-            "vxor.vv      v27, v0, v0             \n\t"
-            "li           t3, 4                   \n\t"
-            "bgtz         t2, BLK_LPST%=          \n\t"
-
-            "BLK_LPND%=:                          \n\t"
-
-            // ========== Store results (4 rows × 32 cols) ==========
-            "mv           t5, %[pC]               \n\t"
-            "vsetvli      t0, %[NBLKS], e32, m1   \n\t"
-            "vse32.v      v28, (%[pC])            \n\t"
-            "add          t5, t5, %[LDC]          \n\t"
-            "vse32.v      v29, (t5)               \n\t"
-            "add          t5, t5, %[LDC]          \n\t"
-            "vse32.v      v30, (t5)               \n\t"
-            "add          t5, t5, %[LDC]          \n\t"
-            "vse32.v      v31, (t5)               \n\t"
-            "add          t5, t5, %[LDC]          \n\t"
-            "FUNC_END%=:                          \n\t"
-
-            :
-            : [KBLKS] "r"(k_blks), [NBLKS] "r"(nb_real), [pA] "r"(quant_a_ptr), [pB] "r"(quant_b_blk_data),
-              [pC] "r"(c_ptr), [B_STR] "r"(b_ncol_block_stride), [A_STR] "r"(a_nrow_block_stride), [LDC] "r"(ldc * 4)
-            : "cc", "memory", "t0", "t2", "t3", "t4", "t5", "f0", "f1", "f2", "f3", "s2", "s3", "s4", "s5", "s6", "s7");
     }
 }
 
@@ -5557,6 +5160,246 @@ size_t gemm_kernel_i8i2k(size_t          blk_len,
     }
 }
 
+// 4-row Q3_K. B is unpacked once and shared. Activations are swizzled the same
+// way as gemm_kernel_i8i2k_m4, then vmadot.hp folds int8_scale * scales16 * (1/16)
+// into the dot. The superblock epilogue multiplies by a_scale * 16.
+void gemm_kernel_i8i3k_m4(size_t          blk_len,
+                          const uint8_t * quant_a_ptr,
+                          const uint8_t * quant_b_data,
+                          float *         c_ptr,
+                          size_t          count_m,
+                          size_t          count_n,
+                          size_t          k_blks,
+                          size_t          ldc) {
+    GGML_UNUSED(blk_len);
+    GGML_UNUSED(count_m);
+
+    using blk_type           = nrow_block_q3_k<32>;
+    constexpr size_t NB_COLS = 32;
+
+    const blk_type * b_base = reinterpret_cast<const blk_type *>(quant_b_data);
+
+    int64_t a_blk_stride        = q8k_blk_size(256);
+    int64_t a_nrow_block_stride = a_blk_stride * 4;
+    int64_t b_ncol_block_stride = sizeof(blk_type);
+
+    const _Float16 q3_step = (_Float16) 0.0625f;
+    const float    a_post  = 16.0f;
+
+    for (size_t ni = 0; ni < count_n; ni += NB_COLS, c_ptr += NB_COLS) {
+        size_t           nb_real          = std::min<size_t>(NB_COLS, count_n - ni);
+        const blk_type * quant_b_blk_data = b_base + (ni / NB_COLS) * k_blks;
+
+        __asm__ volatile(
+            "mv           t2, %[KBLKS]            \n\t"
+            "li           t3, 4                   \n\t"
+            "mv           s2, %[pA]               \n\t"
+            "addi         s3, %[pA], 16+128       \n\t"
+            "addi         s5, %[pB], 32*16        \n\t"
+            "mv           s4, %[pB]               \n\t"
+            "addi         s6, s5, 1024            \n\t"
+            "addi         s8, s6, 1024            \n\t"
+            "addi         s8, s8, 1024            \n\t"  // scales16
+            "mv           s7, %[pB]               \n\t"
+
+            "vsetvli      t0, x0, e32, m1         \n\t"
+            "vxor.vv      v28, v28, v28           \n\t"  // final fp32 rows
+            "vxor.vv      v29, v29, v29           \n\t"
+            "vxor.vv      v30, v30, v30           \n\t"
+            "vxor.vv      v31, v31, v31           \n\t"
+
+            ".align 4                             \n\t"
+            "BLK_LPST%=:                          \n\t"
+            // scales16 is constant for the superblock. Broadcast it once, times 1/16.
+            "vsetvli      t0, x0, e16, mf2        \n\t"
+            "vle16.v      v1, (s8)                \n\t"
+            "vsetvli      t0, x0, e16, m1         \n\t"
+            "vpack.vv     v22, v1, v1, 3          \n\t"
+            "vfmul.vf     v22, v22, %[Q3STEP]     \n\t"
+            "vxor.vv      v24, v24, v24           \n\t"  // hp acc, one column group per register
+            "vxor.vv      v25, v25, v25           \n\t"
+            "vxor.vv      v26, v26, v26           \n\t"
+            "vxor.vv      v27, v27, v27           \n\t"
+            "K64_LPST%=:                          \n\t"
+
+            // 4 rows x K64. The extra n=3 pack is the swizzle vmadot.hp wants; the
+            // integer kernel's packed register is not a valid hp operand.
+            "vsetvli      t0, x0, e8, mf2         \n\t"
+            "vle8.v       v12, (s3)               \n\t"
+            "addi         s3, s3, 256             \n\t"
+            "vle8.v       v13, (s3)               \n\t"
+            "addi         s3, s3, 256             \n\t"
+            "vle8.v       v14, (s3)               \n\t"
+            "addi         s3, s3, 256             \n\t"
+            "vle8.v       v15, (s3)               \n\t"
+            "addi         s3, s3, -768+64         \n\t"
+            "vsetvli      t0, x0, e8, m1          \n\t"
+            "vpack.vv     v4, v12, v13, 1         \n\t"
+            "vpack.vv     v6, v14, v15, 1         \n\t"
+            "vpack.vv     v2, v4, v6, 2           \n\t"  // v2 = K0, v3 = K32
+            "vpack.vv     v8, v2, v2, 3           \n\t"
+            "vor.vv       v23, v9, v9             \n\t"  // v23 = K16
+            "vpack.vv     v8, v3, v3, 3           \n\t"  // v9 = K48
+
+            // 128 int8 scales = 4 x K16, already multiplied by scales16/16.
+            "vle8.v       v8, (s4)                \n\t"
+            "addi         s4, s4, 128             \n\t"
+            "vfwcvt.f.x.v v10, v8                 \n\t"
+            "vsetvli      t0, x0, e16, m1         \n\t"
+            "vfmul.vv     v1, v10, v22            \n\t"  // K0-31
+            "vfmul.vv     v11, v11, v22           \n\t"  // K32-63
+
+            "vsetvli      t0, x0, e8, m1          \n\t"
+            "vle8.v       v4, (s6)                \n\t"
+            "addi         s6, s6, 128             \n\t"
+            "vle8.v       v5, (s6)                \n\t"
+            "addi         s6, s6, 128             \n\t"
+            "vle8.v       v6, (s6)                \n\t"
+            "addi         s6, s6, 128             \n\t"
+            "vle8.v       v7, (s6)                \n\t"
+            "addi         s6, s6, 128             \n\t"
+
+            // K0-15. Unpack is shared; one hp dot covers the packed 4 rows.
+            "vsetvli      t0, x0, e8, mf2         \n\t"
+            "vle8.v       v0, (s5)                \n\t"
+            "addi         s5, s5, 64              \n\t"
+            "vsetvli      t0, x0, e8, m1          \n\t"
+            "vnot.v       v0, v0                  \n\t"
+            "vand.vi      v12, v4, 0x3            \n\t"
+            "vand.vi      v13, v5, 0x3            \n\t"
+            "vand.vi      v14, v6, 0x3            \n\t"
+            "vand.vi      v15, v7, 0x3            \n\t"
+            "vsetvli      t0, x0, e8, m4          \n\t"
+            "vadd.vi      v12, v12, -4, v0.t      \n\t"
+            "vsetvli      t0, x0, e32, m1         \n\t"
+            "vmadot.hp    v24, v2, v12, v1, 0, i8 \n\t"
+            "vmadot.hp    v25, v2, v13, v1, 1, i8 \n\t"
+            "vmadot.hp    v26, v2, v14, v1, 2, i8 \n\t"
+            "vmadot.hp    v27, v2, v15, v1, 3, i8 \n\t"
+
+            // K16-31. v23 is the swizzled K16 activation.
+            "vsetvli      t0, x0, e8, mf2         \n\t"
+            "vle8.v       v0, (s5)                \n\t"
+            "addi         s5, s5, 64              \n\t"
+            "vsetvli      t0, x0, e8, m1          \n\t"
+            "vsll.vi      v12, v4, 4              \n\t"
+            "vsll.vi      v13, v5, 4              \n\t"
+            "vsll.vi      v14, v6, 4              \n\t"
+            "vsll.vi      v15, v7, 4              \n\t"
+            "vnot.v       v0, v0                  \n\t"
+            "vsrl.vi      v12, v12, 6             \n\t"
+            "vsrl.vi      v13, v13, 6             \n\t"
+            "vsrl.vi      v14, v14, 6             \n\t"
+            "vsrl.vi      v15, v15, 6             \n\t"
+            "vsetvli      t0, x0, e8, m4          \n\t"
+            "vadd.vi      v12, v12, -4, v0.t      \n\t"
+            "vsetvli      t0, x0, e32, m1         \n\t"
+            "vmadot.hp    v24, v23, v12, v1, 4, i8\n\t"
+            "vmadot.hp    v25, v23, v13, v1, 5, i8\n\t"
+            "vmadot.hp    v26, v23, v14, v1, 6, i8\n\t"
+            "vmadot.hp    v27, v23, v15, v1, 7, i8\n\t"
+
+            // K32-47
+            "vsetvli      t0, x0, e16, m1         \n\t"
+            "vmv.v.v      v1, v11                 \n\t"
+            "vsetvli      t0, x0, e8, mf2         \n\t"
+            "vle8.v       v0, (s5)                \n\t"
+            "addi         s5, s5, 64              \n\t"
+            "vsetvli      t0, x0, e8, m1          \n\t"
+            "vsll.vi      v12, v4, 2              \n\t"
+            "vsll.vi      v13, v5, 2              \n\t"
+            "vsll.vi      v14, v6, 2              \n\t"
+            "vsll.vi      v15, v7, 2              \n\t"
+            "vnot.v       v0, v0                  \n\t"
+            "vsrl.vi      v12, v12, 6             \n\t"
+            "vsrl.vi      v13, v13, 6             \n\t"
+            "vsrl.vi      v14, v14, 6             \n\t"
+            "vsrl.vi      v15, v15, 6             \n\t"
+            "vsetvli      t0, x0, e8, m4          \n\t"
+            "vadd.vi      v12, v12, -4, v0.t      \n\t"
+            "vsetvli      t0, x0, e32, m1         \n\t"
+            "vmadot.hp    v24, v3, v12, v1, 0, i8 \n\t"
+            "vmadot.hp    v25, v3, v13, v1, 1, i8 \n\t"
+            "vmadot.hp    v26, v3, v14, v1, 2, i8 \n\t"
+            "vmadot.hp    v27, v3, v15, v1, 3, i8 \n\t"
+
+            // K48-63. v9 is the swizzled K48 activation.
+            "vsetvli      t0, x0, e8, mf2         \n\t"
+            "vle8.v       v0, (s5)                \n\t"
+            "addi         s5, s5, 64              \n\t"
+            "vsetvli      t0, x0, e8, m1          \n\t"
+            "vnot.v       v0, v0                  \n\t"
+            "vsrl.vi      v12, v4, 6              \n\t"
+            "vsrl.vi      v13, v5, 6              \n\t"
+            "vsrl.vi      v14, v6, 6              \n\t"
+            "vsrl.vi      v15, v7, 6              \n\t"
+            "vsetvli      t0, x0, e8, m4          \n\t"
+            "vadd.vi      v12, v12, -4, v0.t      \n\t"
+            "vsetvli      t0, x0, e32, m1         \n\t"
+            "vmadot.hp    v24, v9, v12, v1, 4, i8 \n\t"
+            "vmadot.hp    v25, v9, v13, v1, 5, i8 \n\t"
+            "vmadot.hp    v26, v9, v14, v1, 6, i8 \n\t"
+            "vmadot.hp    v27, v9, v15, v1, 7, i8 \n\t"
+
+            "addi         t3, t3, -1              \n\t"
+            "bgtz         t3, K64_LPST%=          \n\t"
+            "K64_LPND%=:                          \n\t"
+
+            // Same reduction as the Q2_K 4-row hp kernel: column groups, then four rows.
+            "vsetvli      t0, x0, e16, m1         \n\t"
+            "vpack.vv     v2, v24, v25, 1         \n\t"
+            "vpack.vv     v4, v26, v27, 1         \n\t"
+            "vpack.vv     v6, v2, v4, 2           \n\t"  // v6, v7 hold the four rows
+            "vfwcvt.f.f.v v12, v6                 \n\t"
+            "vfwcvt.f.f.v v14, v7                 \n\t"
+
+            "flw          f0, (s2)                \n\t"
+            "flw          f1, 4(s2)               \n\t"
+            "flw          f2, 8(s2)               \n\t"
+            "flw          f3, 12(s2)              \n\t"
+            "fmul.s       f0, f0, %[APOST]        \n\t"
+            "fmul.s       f1, f1, %[APOST]        \n\t"
+            "fmul.s       f2, f2, %[APOST]        \n\t"
+            "fmul.s       f3, f3, %[APOST]        \n\t"
+            "add          s2, s2, %[A_STR]        \n\t"
+            "add          t4, s7, %[B_STR]        \n\t"
+            "addi         s3, s2, (4+32)*4        \n\t"
+            "addi         s5, t4, 32*16           \n\t"
+            "mv           s4, t4                  \n\t"
+            "addi         s6, s5, 1024            \n\t"
+            "addi         s8, s6, 1024            \n\t"
+            "addi         s8, s8, 1024            \n\t"
+            "mv           s7, t4                  \n\t"
+
+            "vsetvli      t0, x0, e32, m1         \n\t"
+            "vfmacc.vf    v28, f0, v12            \n\t"
+            "vfmacc.vf    v29, f1, v13            \n\t"
+            "vfmacc.vf    v30, f2, v14            \n\t"
+            "vfmacc.vf    v31, f3, v15            \n\t"
+            "addi         t2, t2, -1              \n\t"
+            "li           t3, 4                   \n\t"
+            "bgtz         t2, BLK_LPST%=          \n\t"
+            "BLK_LPND%=:                          \n\t"
+
+            "mv           t5, %[pC]               \n\t"
+            "vsetvli      t0, %[NBLKS], e32, m1   \n\t"
+            "vse32.v      v28, (%[pC])            \n\t"
+            "add          t5, t5, %[LDC]          \n\t"
+            "vse32.v      v29, (t5)               \n\t"
+            "add          t5, t5, %[LDC]          \n\t"
+            "vse32.v      v30, (t5)               \n\t"
+            "add          t5, t5, %[LDC]          \n\t"
+            "vse32.v      v31, (t5)               \n\t"
+
+            :
+            : [KBLKS] "r"(k_blks), [NBLKS] "r"(nb_real), [pA] "r"(quant_a_ptr), [pB] "r"(quant_b_blk_data),
+              [pC] "r"(c_ptr), [B_STR] "r"(b_ncol_block_stride), [A_STR] "r"(a_nrow_block_stride),
+              [LDC] "r"(ldc * 4), [Q3STEP] "f"(q3_step), [APOST] "f"(a_post)
+            : "cc", "memory", "t0", "t2", "t3", "t4", "t5", "f0", "f1", "f2", "f3", "s2", "s3", "s4", "s5", "s6",
+              "s7", "s8");
+    }
+}
+
 size_t gemm_kernel_i8i3k(size_t          blk_len,
                          const uint8_t * quant_a_ptr,
                          const uint8_t * quant_b_data,
@@ -5567,11 +5410,7 @@ size_t gemm_kernel_i8i3k(size_t          blk_len,
                          size_t          k_blks,
                          size_t          ldc) {
     if (count_m >= 4) {
-#if 0
-        gemm_kernel_i8i3k_mrow_ref<4, 32>(blk_len, quant_a_ptr, quant_b_data, c_ptr, count_m, count_n, k_blks, ldc);
-#else
         gemm_kernel_i8i3k_m4(blk_len, quant_a_ptr, quant_b_data, c_ptr, count_m, count_n, k_blks, ldc);
-#endif
         return 4;
     } else {
 #if 0
@@ -5758,6 +5597,114 @@ size_t moe_m2_gemm_kernel_i8i5(size_t           blk_len,
     moe_m2_gemm_kernel_i8i5_impl(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n, k_blks, ldc);
 #endif
     return 2;
+}
+
+static const int8_t k_iq4_lut[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+static float iq4_half_to_f32(uint16_t h) {
+    _Float16 f;
+    memcpy(&f, &h, sizeof(f));
+    return (float) f;
+}
+
+static void gemv_iq4_x64_scalar(const uint8_t * a, const uint8_t * b, float * c, size_t count_n, size_t k_blks) {
+    for (size_t col = 0; col < count_n; col++) {
+        float acc = 0.f;
+        const uint8_t * a_blk = a;
+        const uint8_t * b_blk = b;
+        for (size_t kb = 0; kb < k_blks; kb++) {
+            const float   a_scale = *(const float *) a_blk;
+            const int8_t * aq     = (const int8_t *) (a_blk + 6);
+            const uint16_t * d = (const uint16_t *) b_blk;
+            const uint8_t * qs  = b_blk + 64 * sizeof(uint16_t);
+            int32_t dot = 0;
+            for (int e = 0; e < 16; e++) {
+                const uint8_t byte = qs[e * 64 + col];
+                dot += (int32_t) aq[e] * k_iq4_lut[byte & 15];
+                dot += (int32_t) aq[16 + e] * k_iq4_lut[byte >> 4];
+            }
+            acc += (float) dot * a_scale * iq4_half_to_f32(d[col]);
+            a_blk += 38;
+            b_blk += 64 * sizeof(uint16_t) + 1024;
+        }
+        c[col] = acc;
+    }
+}
+
+static void gemv_iq4_x64(const uint8_t * a, const uint8_t * b, float * c, size_t count_n, size_t k_blks) {
+    if (__riscv_vlenb() != 128 || count_n != 64) {
+        gemv_iq4_x64_scalar(a, b, c, count_n, k_blks);
+        return;
+    }
+
+    int8_t lut_rep[64];
+    for (int i = 0; i < 64; i++) {
+        lut_rep[i] = k_iq4_lut[i & 15];
+    }
+    const vint8mf2_t values = __riscv_vle8_v_i8mf2(lut_rep, 64);
+    vfloat32m2_t sumf = __riscv_vfmv_v_f_f32m2(0.f, 64);
+
+    const uint8_t * a_blk = a;
+    const uint8_t * b_blk = b;
+    for (size_t kb = 0; kb < k_blks; kb++) {
+        const float    a_scale = *(const float *) a_blk;
+        const int8_t * aq      = (const int8_t *) (a_blk + 6);
+        const _Float16 * d     = (const _Float16 *) b_blk;
+        const uint8_t * qs     = b_blk + 64 * sizeof(uint16_t);
+
+        vint32m2_t sumi = __riscv_vmv_v_x_i32m2(0, 64);
+        for (int e = 0; e < 16; e++) {
+            const vuint8mf2_t packed = __riscv_vle8_v_u8mf2(qs + e * 64, 64);
+            const vint8mf2_t  lo     = __riscv_vrgather_vv_i8mf2(values, __riscv_vand_vx_u8mf2(packed, 0xf, 64), 64);
+            const vint8mf2_t  hi     = __riscv_vrgather_vv_i8mf2(values, __riscv_vsrl_vx_u8mf2(packed, 4, 64), 64);
+            const vint16m1_t  lo16   = __riscv_vwmul_vx_i16m1(lo, aq[e], 64);
+            const vint16m1_t  hi16   = __riscv_vwmul_vx_i16m1(hi, aq[16 + e], 64);
+            sumi = __riscv_vadd_vv_i32m2(sumi, __riscv_vwadd_vv_i32m2(lo16, hi16, 64), 64);
+        }
+
+        const vfloat16m1_t bd  = __riscv_vle16_v_f16m1(d, 64);
+        const vfloat32m2_t bd32 = __riscv_vfwcvt_f_f_v_f32m2(bd, 64);
+        const vfloat32m2_t sc   = __riscv_vfmul_vf_f32m2(bd32, a_scale, 64);
+        sumf = __riscv_vfmacc_vv_f32m2(sumf, __riscv_vfcvt_f_x_v_f32m2(sumi, 64), sc, 64);
+
+        a_blk += 38;
+        b_blk += 64 * sizeof(uint16_t) + 1024;
+    }
+    __riscv_vse32_v_f32m2(c, sumf, 64);
+}
+
+size_t gemm_kernel_iq4nl(size_t          blk_len,
+                         const uint8_t * quant_a_ptr,
+                         const uint8_t * quant_b_data,
+                         const uint8_t * quant_b_zp,
+                         float *         c_ptr,
+                         size_t          count_m,
+                         size_t          count_n,
+                         size_t          k_blks,
+                         size_t          ldc) {
+    // Only the single-row call is handed the whole slice, so the packed pointer
+    // matches quant_b_data. A shorter row tile is stepped 64 columns at a time
+    // and that pointer would go stale. Those stay on vmadot.
+    // count_n == 64 is the last row of a prefill tile, not a decode slice.
+    if (count_m == 1 && quant_b_zp != nullptr && count_n > 64 && count_n % 64 == 0) {
+        const size_t group_bytes = k_blks * (64 * sizeof(uint16_t) + 1024);
+        for (size_t n = 0; n < count_n; n += 64) {
+            gemv_iq4_x64(quant_a_ptr, quant_b_zp + (n / 64) * group_bytes, c_ptr + n, 64, k_blks);
+        }
+        return 1;
+    }
+    if (count_m >= 4 && count_n > 32) {
+        const size_t col_bytes = k_blks * (sizeof(uint16_t) + blk_len);
+        for (size_t n = 0; n < count_n; n += 32) {
+            const size_t cols = std::min(count_n - n, (size_t) 32);
+            gemm_kernel_i8i8(blk_len, quant_a_ptr, quant_b_data + n * col_bytes, nullptr, c_ptr + n, count_m, cols,
+                             k_blks, ldc);
+        }
+        return 4;
+    }
+    return gemm_kernel_i8i8(blk_len, quant_a_ptr, quant_b_data, nullptr, c_ptr, count_m, count_n, k_blks, ldc);
 }
 
 }  // namespace ime2

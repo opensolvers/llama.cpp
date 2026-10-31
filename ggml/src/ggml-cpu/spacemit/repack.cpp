@@ -1816,6 +1816,32 @@ static int repack_iq4_nl_to_q8_0_32_bl(ggml_tensor *              t,
     return 0;
 }
 
+// Packed nibbles after the Q8 prefix, 64 columns at a time. qs[byte * 64 + col]
+// is nibble byte `byte` of that column. Decode dots this; prefill ignores it.
+static void append_iq4_nl_packed_tail(ggml_tensor * t, const void * data) {
+    constexpr int nrows_interleaved = 64;
+    const int     nrow               = ggml_nrows(t);
+    const int     nblocks            = t->ne[0] / QK4_NL;
+    const block_iq4_nl * src = (const block_iq4_nl *) data;
+    uint8_t * dst = (uint8_t *) t->data + (size_t) nrow * nblocks * sizeof(block_q8_0);
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            uint16_t * d  = (uint16_t *) dst;
+            uint8_t *  qs = dst + 64 * sizeof(uint16_t);
+            for (int col = 0; col < nrows_interleaved; col++) {
+                const block_iq4_nl & s = src[x + col * nblocks];
+                d[col] = s.d;
+                for (int byte = 0; byte < QK4_NL / 2; byte++) {
+                    qs[byte * nrows_interleaved + col] = s.qs[byte];
+                }
+            }
+            dst += 64 * sizeof(uint16_t) + QK4_NL * 32;
+        }
+        src += nrows_interleaved * nblocks;
+    }
+}
+
 namespace ggml::cpu::riscv64_spacemit {
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> int repack(ggml_tensor *, const void *, size_t);
@@ -1914,6 +1940,15 @@ template <> int repack<block_q5_K, 32, 32>(ggml_tensor * t, const void * data, s
 
 template <> int repack<block_iq4_nl, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
     return repack_iq4_nl_to_q8_0_32_bl(t, 32, data, data_size);
+}
+
+template <> int repack<block_iq4_nl, 32, 64>(ggml_tensor * t, const void * data, size_t data_size) {
+    const int rc = repack_iq4_nl_to_q8_0_32_bl(t, 32, data, data_size);
+    if (rc != 0) {
+        return rc;
+    }
+    append_iq4_nl_packed_tail(t, data);
+    return 0;
 }
 
 }  // namespace ggml::cpu::riscv64_spacemit

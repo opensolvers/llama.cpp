@@ -82,7 +82,10 @@ struct TLSContext {
 thread_local TLSContext tls_context;
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> constexpr size_t get_repacked_block_type_size() {
-    if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0> || std::is_same_v<BLOC_TYPE, block_iq4_nl>) {
+    if constexpr (std::is_same_v<BLOC_TYPE, block_iq4_nl>) {
+        // Stride of the expanded Q8 prefix. Packed nibbles sit after that prefix.
+        return sizeof(block_q8_0);
+    } else if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) {
         return sizeof(block_q8_0);
     } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0>) {
         return sizeof(block_q4_0) * INTER_SIZE / QK4_0;
@@ -270,7 +273,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8;
             block_stride_a     = spacemit_kernels::q8_blk_size(a_blk_len, true);
 
-            if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0> || std::is_same_v<BLOC_TYPE, block_iq4_nl>) {
+            if constexpr (std::is_same_v<BLOC_TYPE, block_iq4_nl>) {
+                gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_iq4nl;
+                set_kernel_impl = true;
+            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) {
                 gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8i8;
                 set_kernel_impl = true;
             } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
@@ -518,6 +524,15 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
                 uint8_t * b_col    = reinterpret_cast<uint8_t *>(w_data) + n_start * row_stride_b;
                 uint8_t * b_col_zp = block_type_has_zp<BLOC_TYPE>() ? b_col : nullptr;
+                if constexpr (std::is_same_v<BLOC_TYPE, block_iq4_nl>) {
+                    // Packed nibbles live after the expanded Q8 prefix. The single-row
+                    // dot of that tail is only faster once enough cores are reading it.
+                    if (nth >= 8) {
+                        const size_t packed_group = (size_t) b_k_blks * (64 * sizeof(ggml_half) + QK4_NL * 32);
+                        b_col_zp = reinterpret_cast<uint8_t *>(w_data) + (size_t) gemm_n * row_stride_b +
+                                   (size_t) (n_start / 64) * packed_group;
+                    }
+                }
 
                 int64_t n_blk_real = 0;
                 for (int64_t ni = 0; ni < n_count; ni += n_blk_real, b_col += n_blk_real * row_stride_b) {
@@ -531,6 +546,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
                     uint8_t * b_col_cur    = b_col;
                     uint8_t * b_col_zp_cur = b_col_zp;
+                    if constexpr (std::is_same_v<BLOC_TYPE, block_iq4_nl>) {
+                        const size_t packed_group = (size_t) b_k_blks * (64 * sizeof(ggml_half) + QK4_NL * 32);
+                        b_col_zp_cur += (size_t) (ni / 64) * packed_group;
+                    }
 
                     while (rows_remaining > 0) {
                         auto rows_handled = gemm_kernel(b_blk_len, a_row, b_col_cur, b_col_zp_cur, c_blk,
@@ -580,7 +599,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             quantize_a_row_i8 = spacemit_kernels::rvv::quantize_a_row_i8;
             block_stride_a    = spacemit_kernels::q8_blk_size(QK4_0, true);
 
-            if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0> || std::is_same_v<BLOC_TYPE, block_iq4_nl>) {
+            if constexpr (std::is_same_v<BLOC_TYPE, block_iq4_nl>) {
+                gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_iq4nl;
+                set_kernel_impl = true;
+            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) {
                 gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8i8;
                 set_kernel_impl = true;
             } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
@@ -1273,7 +1295,7 @@ static const tensor_traits<block_mxfp4, 32, 32> mxfp4_32x32_q8_0;
 static const tensor_traits<block_q5_K, 32, 32>  q5_k_32x32_q8_0;
 static const tensor_traits<block_q5_1, 32, 32>  q5_1_32x32_q8_0;
 static const tensor_traits<block_q5_0, 32, 32>  q5_0_32x32_q8_0;
-static const tensor_traits<block_iq4_nl, 32, 32> iq4_nl_32x32_q8_0;
+static const tensor_traits<block_iq4_nl, 32, 64> iq4_nl_64x32_q8_0;
 // Impl By RVV
 static const tensor_traits_common               rvv_impl;
 
@@ -1419,10 +1441,10 @@ static const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack
         case GGML_TYPE_IQ4_NL:
             {
 #if defined(RISCV64_SPACEMIT_IME2)
-                // Expanded to the Q8_0 tile. ne[0] is the K block axis.
-                if (cur->ne[1] % 32 == 0 && cur->ne[0] % QK4_NL == 0 &&
+                // Packed 64-wide nibbles. ne[0] is the K block axis.
+                if (cur->ne[1] % 64 == 0 && cur->ne[0] % QK4_NL == 0 &&
                     (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
-                    return &ggml::cpu::riscv64_spacemit::iq4_nl_32x32_q8_0;
+                    return &ggml::cpu::riscv64_spacemit::iq4_nl_64x32_q8_0;
                 }
 #endif
             }
@@ -1612,7 +1634,8 @@ static size_t ggml_backend_cpu_riscv64_spacemit_nbytes(ggml_backend_buffer_type_
             nbytes = remap_block_nbytes(sizeof(block_q5_0), sizeof(spacemit_kernels::nrow_block_q5_0<1>));
             break;
         case GGML_TYPE_IQ4_NL:
-            nbytes = remap_block_nbytes(sizeof(block_iq4_nl), sizeof(block_q8_0), 32);
+            nbytes = remap_block_nbytes(sizeof(block_iq4_nl), sizeof(block_q8_0), 32) +
+                     remap_block_nbytes(sizeof(block_iq4_nl), sizeof(ggml_half) + QK4_NL / 2, 64);
             break;
         default:
             nbytes = add_strided_nbytes(row_nbytes, 1, 1);
